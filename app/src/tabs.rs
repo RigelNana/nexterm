@@ -263,18 +263,25 @@ impl TabManager {
     }
 
     /// Split the focused pane in the active tab.
+    /// The new pane inherits the terminal type: local panes spawn the same shell,
+    /// SSH panes open a new connection to the same host.
     pub fn split_focused(
         &mut self,
         direction: SplitDir,
         cell_w: f32,
         cell_h: f32,
         shell: Option<&str>,
+        rt: &Runtime,
     ) -> anyhow::Result<()> {
         let tab = &self.tabs[self.active_tab];
         let focused = tab.focused_pane;
 
         // The new pane gets a temporary viewport; will be recomputed on next layout pass.
-        let viewport = self.panes[&focused].viewport;
+        let focused_pane = &self.panes[&focused];
+        let viewport = focused_pane.viewport;
+        let ssh_profile = focused_pane.ssh_profile();
+        let local_shell = focused_pane.local_shell();
+
         let new_id = self.alloc_pane_id();
         let half_rect = match direction {
             SplitDir::Horizontal => Rect {
@@ -291,13 +298,22 @@ impl TabManager {
             },
         };
 
-        let pane = Pane::new(new_id, half_rect, cell_w, cell_h, shell)?;
-        self.panes.insert(new_id, pane);
+        if let Some(profile) = ssh_profile {
+            // SSH pane → open a new SSH connection to the same host
+            let pane = Pane::new_ssh(new_id, half_rect, cell_w, cell_h, profile, rt);
+            self.panes.insert(new_id, pane);
+            info!(focused, new_id, ?direction, "SSH pane split");
+        } else {
+            // Local pane → spawn the same shell
+            let effective_shell = local_shell.as_deref().or(shell);
+            let pane = Pane::new(new_id, half_rect, cell_w, cell_h, effective_shell)?;
+            self.panes.insert(new_id, pane);
+            info!(focused, new_id, ?direction, "local pane split");
+        }
 
         let tab = &mut self.tabs[self.active_tab];
         tab.layout.split_pane(focused, new_id, direction);
 
-        info!(focused, new_id, ?direction, "pane split");
         Ok(())
     }
 

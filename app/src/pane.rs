@@ -57,9 +57,13 @@ pub enum PaneKind {
     Local {
         pty: LocalPty,
         writer: Box<dyn Write + Send>,
+        /// Shell path used to spawn this pane (for cloning on split).
+        shell: Option<String>,
     },
     Ssh {
         session: SshSession,
+        /// Profile used to connect (cloned when splitting).
+        profile: SshProfile,
     },
 }
 
@@ -126,7 +130,7 @@ impl Pane {
             id,
             terminal,
             output_rx: rx,
-            kind: PaneKind::Local { pty, writer },
+            kind: PaneKind::Local { pty, writer, shell: shell.map(|s| s.to_string()) },
             viewport,
             cols,
             rows,
@@ -155,6 +159,7 @@ impl Pane {
         let terminal = TerminalParser::new(cols, rows);
         let host = profile.host.clone();
 
+        let profile_clone = profile.clone();
         let (output_rx, session) =
             crate::ssh_backend::spawn_ssh_pane(rt, profile, cols as u16, rows as u16);
 
@@ -164,7 +169,7 @@ impl Pane {
             id,
             terminal,
             output_rx,
-            kind: PaneKind::Ssh { session },
+            kind: PaneKind::Ssh { session, profile: profile_clone },
             viewport,
             cols,
             rows,
@@ -194,7 +199,7 @@ impl Pane {
                 PaneKind::Local { pty, .. } => {
                     let _ = pty.resize(new_cols as u16, new_rows as u16);
                 }
-                PaneKind::Ssh { session } => {
+                PaneKind::Ssh { session, .. } => {
                     session.resize(new_cols as u16, new_rows as u16);
                 }
             }
@@ -281,7 +286,7 @@ impl Pane {
                 let _ = writer.write_all(data);
                 let _ = writer.flush();
             }
-            PaneKind::Ssh { session } => {
+            PaneKind::Ssh { session, .. } => {
                 session.write(data);
             }
         }
@@ -317,10 +322,26 @@ impl Pane {
         matches!(self.kind, PaneKind::Ssh { .. })
     }
 
+    /// Get the SSH profile if this is an SSH pane (for cloning on split).
+    pub fn ssh_profile(&self) -> Option<SshProfile> {
+        match &self.kind {
+            PaneKind::Ssh { profile, .. } => Some(profile.clone()),
+            _ => None,
+        }
+    }
+
+    /// Get the shell path if this is a local pane (for cloning on split).
+    pub fn local_shell(&self) -> Option<String> {
+        match &self.kind {
+            PaneKind::Local { shell, .. } => shell.clone(),
+            _ => None,
+        }
+    }
+
     /// Get a snapshot of the server status (SSH panes only).
     pub fn server_status(&self) -> Option<crate::ssh_backend::ServerStatus> {
         match &self.kind {
-            PaneKind::Ssh { session } => Some(session.status.lock().unwrap().clone()),
+            PaneKind::Ssh { session, .. } => Some(session.status.lock().unwrap().clone()),
             _ => None,
         }
     }
@@ -328,7 +349,7 @@ impl Pane {
     /// Poll for SFTP results and update the browser state. Returns true if state changed.
     pub fn poll_sftp(&mut self) -> bool {
         let session = match &self.kind {
-            PaneKind::Ssh { session } => session,
+            PaneKind::Ssh { session, .. } => session,
             _ => return false,
         };
         let mut changed = false;
@@ -393,7 +414,7 @@ impl Pane {
 
     /// Navigate the SFTP browser to a path.
     pub fn sftp_navigate(&self, path: &str) {
-        if let PaneKind::Ssh { session } = &self.kind {
+        if let PaneKind::Ssh { session, .. } = &self.kind {
             session.sftp_command(SftpCommand::ListDir(path.to_string()));
         }
     }
@@ -409,28 +430,28 @@ impl Pane {
 
     /// Navigate SFTP browser to home.
     pub fn sftp_go_home(&self) {
-        if let PaneKind::Ssh { session } = &self.kind {
+        if let PaneKind::Ssh { session, .. } = &self.kind {
             session.sftp_command(SftpCommand::GoHome);
         }
     }
 
     /// Create a remote directory.
     pub fn sftp_mkdir(&self, path: &str) {
-        if let PaneKind::Ssh { session } = &self.kind {
+        if let PaneKind::Ssh { session, .. } = &self.kind {
             session.sftp_command(SftpCommand::Mkdir(path.to_string()));
         }
     }
 
     /// Create a remote empty file.
     pub fn sftp_touch(&self, path: &str) {
-        if let PaneKind::Ssh { session } = &self.kind {
+        if let PaneKind::Ssh { session, .. } = &self.kind {
             session.sftp_command(SftpCommand::Touch(path.to_string()));
         }
     }
 
     /// Download a remote file to a local path.
     pub fn sftp_download(&mut self, remote_path: &str, local_path: &str) {
-        if let PaneKind::Ssh { session } = &self.kind {
+        if let PaneKind::Ssh { session, .. } = &self.kind {
             // Register transfer locally so UI shows it before first progress event.
             self.sftp_state.transfers.push(TransferStatus {
                 direction: crate::ssh_backend::TransferDir::Download,
@@ -450,7 +471,7 @@ impl Pane {
 
     /// Upload a local file to a remote path.
     pub fn sftp_upload(&mut self, local_path: &str, remote_path: &str) {
-        if let PaneKind::Ssh { session } = &self.kind {
+        if let PaneKind::Ssh { session, .. } = &self.kind {
             self.sftp_state.transfers.push(TransferStatus {
                 direction: crate::ssh_backend::TransferDir::Upload,
                 remote_path: remote_path.to_string(),

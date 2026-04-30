@@ -451,13 +451,13 @@ impl App {
             GuiAction::SplitHorizontal => {
                 let (cw, ch) = self.renderer.as_ref().unwrap().cell_size();
                 let shell = self.configured_shell().map(|s| s.to_string());
-                let _ = self.tab_manager.split_focused(SplitDir::Horizontal, cw, ch, shell.as_deref());
+                let _ = self.tab_manager.split_focused(SplitDir::Horizontal, cw, ch, shell.as_deref(), &self.tokio_rt);
                 self.relayout();
             }
             GuiAction::SplitVertical => {
                 let (cw, ch) = self.renderer.as_ref().unwrap().cell_size();
                 let shell = self.configured_shell().map(|s| s.to_string());
-                let _ = self.tab_manager.split_focused(SplitDir::Vertical, cw, ch, shell.as_deref());
+                let _ = self.tab_manager.split_focused(SplitDir::Vertical, cw, ch, shell.as_deref(), &self.tokio_rt);
                 self.relayout();
             }
             GuiAction::Find => {
@@ -1652,7 +1652,7 @@ impl ApplicationHandler for App {
                                 // Split horizontal
                                 let (cw, ch) = self.renderer.as_ref().unwrap().cell_size();
                                 let shell = self.configured_shell().map(|s| s.to_string());
-                                let _ = self.tab_manager.split_focused(SplitDir::Horizontal, cw, ch, shell.as_deref());
+                                let _ = self.tab_manager.split_focused(SplitDir::Horizontal, cw, ch, shell.as_deref(), &self.tokio_rt);
                                 self.relayout();
                                 return;
                             }
@@ -1660,7 +1660,7 @@ impl ApplicationHandler for App {
                                 // Split vertical
                                 let (cw, ch) = self.renderer.as_ref().unwrap().cell_size();
                                 let shell = self.configured_shell().map(|s| s.to_string());
-                                let _ = self.tab_manager.split_focused(SplitDir::Vertical, cw, ch, shell.as_deref());
+                                let _ = self.tab_manager.split_focused(SplitDir::Vertical, cw, ch, shell.as_deref(), &self.tokio_rt);
                                 self.relayout();
                                 return;
                             }

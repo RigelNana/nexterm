@@ -462,7 +462,7 @@ impl Renderer {
                         // Tiny 5% tolerance avoids spurious expansion for ASCII whose
                         // bitmap exactly matches cell width.
                         let total_w = info.offset_x + info.width as f32;
-                        let needed = if total_w > cw * 1.05 {
+                        let needed = if total_w > cw * 1.2 {
                             (total_w / cw).ceil().max(1.0)
                         } else {
                             1.0
@@ -912,7 +912,7 @@ impl Renderer {
                             // Expand quad for any glyph noticeably wider than the cell
                             // (Nerd Font icons 1.0-1.5x cell were clipped before).
                             let total_w = info.offset_x + info.width as f32;
-                            let needed = if total_w > cw * 1.05 {
+                            let needed = if total_w > cw * 1.2 {
                                 (total_w / cw).ceil().max(1.0)
                             } else {
                                 1.0
