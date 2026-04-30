@@ -1,0 +1,16 @@
+[package]
+name = "nexterm-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "TOML configuration system with hot-reload for NexTerm"
+
+[dependencies]
+toml.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+dirs.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "nexterm-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Session persistence: SSH profile groups, tree-based session manager"
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+nexterm-ssh.workspace = true

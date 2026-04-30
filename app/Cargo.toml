@@ -1,0 +1,46 @@
+[package]
+name = "nexterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NexTerm — AI-native GPU-accelerated terminal with SSH & SFTP"
+
+[[bin]]
+name = "nexterm"
+path = "src/main.rs"
+
+[dependencies]
+# NexTerm crates
+nexterm-core.workspace = true
+nexterm-vte.workspace = true
+nexterm-pty.workspace = true
+nexterm-render.workspace = true
+nexterm-ui.workspace = true
+nexterm-ssh.workspace = true
+nexterm-sftp.workspace = true
+nexterm-session.workspace = true
+nexterm-keystore.workspace = true
+nexterm-config.workspace = true
+nexterm-history.workspace = true
+nexterm-theme.workspace = true
+nexterm-agent.workspace = true
+
+# Runtime
+russh.workspace = true
+russh-sftp.workspace = true
+tokio.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+pollster = "0.4"
+arboard = "3"
+rfd = "0.15"
+uuid.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+raw-window-handle.workspace = true
+dirs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

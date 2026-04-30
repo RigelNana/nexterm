@@ -1,0 +1,13 @@
+[package]
+name = "nexterm-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "UI components: tab bar, split panes, sidebar, AI chat panel"
+
+[dependencies]
+nexterm-core.workspace = true
+nexterm-render.workspace = true
+tracing.workspace = true
+uuid.workspace = true

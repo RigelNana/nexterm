@@ -1,0 +1,3 @@
+[submodule "lib/agent_engine"]
+	path = lib/agent_engine
+	url = https://github.com/RigelNana/Agenium.git

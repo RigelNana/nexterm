@@ -1,0 +1,151 @@
+[workspace]
+resolver = "2"
+exclude = ["lib/agent_engine"]
+members = [
+    "crates/nexterm-core",
+    "crates/nexterm-vte",
+    "crates/nexterm-pty",
+    "crates/nexterm-render",
+    "crates/nexterm-ui",
+    "crates/nexterm-ssh",
+    "crates/nexterm-sftp",
+    "crates/nexterm-session",
+    "crates/nexterm-keystore",
+    "crates/nexterm-config",
+    "crates/nexterm-history",
+    "crates/nexterm-theme",
+    "crates/nexterm-sync",
+    "crates/nexterm-agent",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/RigelNana/nexterm"
+homepage = "https://github.com/RigelNana/nexterm"
+keywords = ["terminal", "ssh", "ai-agent", "gpu-accelerated"]
+categories = ["command-line-utilities", "network-programming"]
+
+[workspace.dependencies]
+# === Async runtime ===
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7" }
+async-trait = "0.1"
+async-stream = "0.3"
+futures = "0.3"
+
+# === Serialization ===
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# === Error handling ===
+thiserror = "2"
+anyhow = "1"
+
+# === HTTP (needed by agent_engine) ===
+reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json"], default-features = false }
+eventsource-stream = "0.2"
+
+# === Time ===
+jiff = { version = "0.2", features = ["serde"] }
+
+# === Logging & Tracing ===
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# === OpenTelemetry (needed by agent_engine) ===
+opentelemetry = "0.29"
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.29"
+tracing-opentelemetry = "0.30"
+
+# === Pattern matching (needed by agent_engine) ===
+wildmatch = "2"
+jsonschema = "0.29"
+
+# === Env ===
+dotenvy = "0.15"
+
+# === GPU Rendering ===
+wgpu = "24"
+winit = "0.30"
+raw-window-handle = "0.6"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+
+# === Text & Font ===
+cosmic-text = "0.12"
+swash = "0.1"
+
+# === Terminal Emulation ===
+vte = "0.13"
+unicode-width = "0.2"
+
+# === PTY ===
+portable-pty = "0.8"
+
+# === SSH / SFTP ===
+russh = "0.46"
+russh-sftp = "2.0"
+russh-keys = "0.46"
+ssh2-config = "0.2"
+
+# === Data Storage ===
+rusqlite = { version = "0.39", features = ["bundled-full"] }
+
+# === Secrets ===
+keyring = "3"
+
+# === Config ===
+toml = "0.8"
+notify = "7"
+
+# === Platform ===
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi"] }
+
+# === Misc ===
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+regex = "1"
+base64 = "0.22"
+image = "0.25"
+
+# === Testing ===
+mockall = "0.13"
+tempfile = "3"
+
+# === Agent Engine (local path) ===
+agent-core = { path = "lib/agent_engine/crates/agent-core", package = "agenium-core" }
+agent-provider = { path = "lib/agent_engine/crates/agent-provider", package = "agenium-provider" }
+agent-tool = { path = "lib/agent_engine/crates/agent-tool", package = "agenium-tool" }
+agent-tools = { path = "lib/agent_engine/crates/agent-tools", package = "agenium-tools" }
+agent-permission = { path = "lib/agent_engine/crates/agent-permission", package = "agenium-permission" }
+agent-context = { path = "lib/agent_engine/crates/agent-context", package = "agenium-context" }
+agent-sandbox = { path = "lib/agent_engine/crates/agent-sandbox", package = "agenium-sandbox" }
+agent-mcp = { path = "lib/agent_engine/crates/agent-mcp", package = "agenium-mcp" }
+agent-session = { path = "lib/agent_engine/crates/agent-session", package = "agenium-session" }
+agent-prompt = { path = "lib/agent_engine/crates/agent-prompt", package = "agenium-prompt" }
+agent-vault = { path = "lib/agent_engine/crates/agent-vault", package = "agenium-vault" }
+agent-observe = { path = "lib/agent_engine/crates/agent-observe", package = "agenium-observe" }
+agent-skill = { path = "lib/agent_engine/crates/agent-skill", package = "agenium-skill" }
+
+# === Workspace crates ===
+nexterm-core = { path = "crates/nexterm-core" }
+nexterm-vte = { path = "crates/nexterm-vte" }
+nexterm-pty = { path = "crates/nexterm-pty" }
+nexterm-render = { path = "crates/nexterm-render" }
+nexterm-ui = { path = "crates/nexterm-ui" }
+nexterm-ssh = { path = "crates/nexterm-ssh" }
+nexterm-sftp = { path = "crates/nexterm-sftp" }
+nexterm-session = { path = "crates/nexterm-session" }
+nexterm-keystore = { path = "crates/nexterm-keystore" }
+nexterm-config = { path = "crates/nexterm-config" }
+nexterm-history = { path = "crates/nexterm-history" }
+nexterm-theme = { path = "crates/nexterm-theme" }
+nexterm-sync = { path = "crates/nexterm-sync" }
+nexterm-agent = { path = "crates/nexterm-agent" }

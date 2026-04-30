@@ -1,0 +1,13 @@
+[package]
+name = "nexterm-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cross-platform PTY abstraction (ConPTY / Unix PTY) for NexTerm"
+
+[dependencies]
+portable-pty.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
