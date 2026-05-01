@@ -125,6 +125,8 @@ pub struct ProcessInfo {
     pub name: String,
     pub cpu_pct: f32,
     pub mem_str: String,
+    /// Raw RSS in KB for sorting.
+    pub mem_kb: u64,
 }
 
 impl Default for ServerStatus {
@@ -240,7 +242,7 @@ const NET_HISTORY_MAX: usize = 60;
 /// One-liner that works on Linux/macOS/FreeBSD and outputs parseable status.
 /// Collects: OS, kernel, hostname, uptime, memory, CPU idle (from /proc/stat),
 /// per-disk usage (df -hT, all real filesystems), and network counters (/proc/net/dev).
-const STATUS_PROBE_CMD: &str = r#"echo "OS:$(uname -s)"; echo "KERNEL:$(uname -r)"; echo "HOST:$(hostname)"; echo "UPTIME:$(uptime)"; if [ -f /proc/meminfo ]; then MT=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo); MA=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); echo "MEM:${MT}:$((MT-MA))"; else echo "MEM:0:0"; fi; if [ -f /proc/stat ]; then head -1 /proc/stat | awk '{t=0;for(i=2;i<=NF;i++)t+=$i; printf "CPU:%d:%d\n",t,$5}'; fi; df -hT 2>/dev/null | awk 'NR>1 && $2!="tmpfs" && $2!="devtmpfs" && $2!="squashfs" && $2!="overlay" && $1!="tmpfs"{printf "DF:%s:%s:%s:%s:%s:%s\n",$7,$2,$3,$4,$5,$6}' || df -h 2>/dev/null | awk 'NR>1 && $1!="tmpfs" && $1!="devtmpfs"{printf "DF:%s::%s:%s:%s:%s\n",$6,$2,$3,$4,$5}'; if [ -f /proc/net/dev ]; then awk -F'[: ]+' 'NR>2 && $2!="lo"{printf "NET:%s:%s:%s\n",$2,$3,$11}' /proc/net/dev 2>/dev/null; fi; ps aux --sort=-%cpu 2>/dev/null | awk 'NR>1 && NR<=9{m=$6; if(m>=1048576){ms=sprintf("%.1fG",m/1048576)}else if(m>=1024){ms=sprintf("%.1fM",m/1024)}else{ms=m"K"}; printf "PROC:%s:%.1f:%s\n",$11,$3,ms}'; echo "DONE""#;
+const STATUS_PROBE_CMD: &str = r#"echo "OS:$(uname -s)"; echo "KERNEL:$(uname -r)"; echo "HOST:$(hostname)"; echo "UPTIME:$(uptime)"; if [ -f /proc/meminfo ]; then MT=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo); MA=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); echo "MEM:${MT}:$((MT-MA))"; else echo "MEM:0:0"; fi; if [ -f /proc/stat ]; then head -1 /proc/stat | awk '{t=0;for(i=2;i<=NF;i++)t+=$i; printf "CPU:%d:%d\n",t,$5}'; fi; df -hT 2>/dev/null | awk 'NR>1 && $2!="tmpfs" && $2!="devtmpfs" && $2!="squashfs" && $2!="overlay" && $1!="tmpfs"{printf "DF:%s:%s:%s:%s:%s:%s\n",$7,$2,$3,$4,$5,$6}' || df -h 2>/dev/null | awk 'NR>1 && $1!="tmpfs" && $1!="devtmpfs"{printf "DF:%s::%s:%s:%s:%s\n",$6,$2,$3,$4,$5}'; if [ -f /proc/net/dev ]; then awk 'NR>2{gsub(/^ +/,""); split($1,a,":"); name=a[1]; if(name!="lo"){printf "NET:%s:%s:%s\n",name,$2,$10}}' /proc/net/dev 2>/dev/null; fi; ps aux --sort=-%cpu 2>/dev/null | awk 'NR>1 && NR<=9{m=$6; if(m>=1048576){ms=sprintf("%.1fG",m/1048576)}else if(m>=1024){ms=sprintf("%.1fM",m/1024)}else{ms=m"K"}; printf "PROC:%s|%.1f|%s|%d\n",$11,$3,ms,$6}'; echo "DONE""#;
 
 /// Parse the output of STATUS_PROBE_CMD into a ServerStatus.
 fn parse_status_output(raw: &str, latency_ms: u32, connected_at: Instant) -> ServerStatus {
@@ -321,13 +323,14 @@ fn parse_status_output(raw: &str, latency_ms: u32, connected_at: Instant) -> Ser
                 });
             }
         } else if let Some(val) = line.strip_prefix("PROC:") {
-            // PROC:command_name:cpu_pct:mem_str
-            let parts: Vec<&str> = val.splitn(3, ':').collect();
-            if parts.len() == 3 {
+            // PROC:command_name|cpu_pct|mem_str|mem_kb (uses | to avoid : in command names)
+            let parts: Vec<&str> = val.splitn(4, '|').collect();
+            if parts.len() >= 3 {
                 let name = parts[0].rsplit('/').next().unwrap_or(parts[0]).to_string();
                 let cpu_pct: f32 = parts[1].trim().parse().unwrap_or(0.0);
                 let mem_str = parts[2].trim().to_string();
-                s.top_procs.push(ProcessInfo { name, cpu_pct, mem_str });
+                let mem_kb: u64 = parts.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                s.top_procs.push(ProcessInfo { name, cpu_pct, mem_str, mem_kb });
             }
         } else if line.starts_with("DISK:") {
             // Legacy fallback

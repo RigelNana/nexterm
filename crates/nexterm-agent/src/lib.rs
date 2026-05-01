@@ -8,6 +8,11 @@
 //! - Route Agent tool-call results to the correct pane/session
 //! - Manage Ambient Agent (background error detection)
 
+pub mod ambient;
 pub mod bridge;
 pub mod tools;
-pub mod ambient;
+
+pub use bridge::{
+    AgentBridge, AgentBridgeCommand, AgentBridgeConfig, AgentBridgeEvent, AgentBridgeWorker,
+};
+pub use tools::{ToolRequest, ToolResponse};

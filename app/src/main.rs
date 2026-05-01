@@ -12,7 +12,8 @@ mod tabs;
 
 use anyhow::Result;
 use nexterm_config::schema::AppConfig;
-use nexterm_render::gui::{self, GuiAction, GuiState};
+use nexterm_agent::{AgentBridge, AgentBridgeCommand, AgentBridgeConfig, AgentBridgeEvent, ToolRequest, ToolResponse};
+use nexterm_render::gui::{self, AgentChatMessage, AgentChatRole, GuiAction, GuiState};
 use nexterm_render::renderer::Renderer;
 use nexterm_history::HistoryDb;
 use nexterm_session::store::SessionStore;
@@ -100,6 +101,9 @@ struct App {
     /// True once the window has been made visible after the first paint.
     /// We start the window hidden to avoid the unpainted-transparent-window flash.
     window_visible: bool,
+
+    // AI Agent bridge
+    agent_bridge: Option<AgentBridge>,
 }
 
 impl App {
@@ -135,6 +139,16 @@ impl App {
                 gs.settings_opacity = config.appearance.opacity;
                 gs.settings_padding = config.appearance.padding;
                 gs.settings_background_image = config.appearance.background_image.clone();
+                // Load AI agent config
+                gs.agent_provider_type = config.ai.provider.clone();
+                gs.agent_base_url = config.ai.base_url.clone();
+                gs.agent_model_id = config.ai.model.clone();
+                // Resolve API key: direct value takes priority, then env var
+                gs.agent_api_key = if !config.ai.api_key.is_empty() {
+                    config.ai.api_key.clone()
+                } else {
+                    std::env::var(&config.ai.api_key_env).unwrap_or_default()
+                };
                 gs
             },
             session_store: {
@@ -170,6 +184,7 @@ impl App {
             shell_detect_tx,
             shell_detect_rx,
             window_visible: false,
+            agent_bridge: None,
         };
         // Load saved profiles from database
         app.load_profiles_from_store();
@@ -230,6 +245,159 @@ impl App {
             }
             Err(e) => {
                 warn!("failed to load history: {e}");
+            }
+        }
+    }
+
+    /// Ensure the Agent bridge is created and its worker spawned.
+    fn ensure_agent_bridge(&mut self) {
+        if self.agent_bridge.is_some() {
+            return;
+        }
+        let config = AgentBridgeConfig {
+            provider_type: self.gui_state.agent_provider_type.clone(),
+            base_url: self.gui_state.agent_base_url.clone(),
+            api_key: self.gui_state.agent_api_key.clone(),
+            model_id: self.gui_state.agent_model_id.clone(),
+            ..Default::default()
+        };
+        let (bridge, worker) = AgentBridge::new(config);
+        self.tokio_rt.spawn(async move {
+            if let Err(e) = worker.run().await {
+                tracing::error!("agent bridge worker exited: {e}");
+            }
+        });
+        self.agent_bridge = Some(bridge);
+        info!("agent bridge started");
+    }
+
+    /// Drain agent bridge events and update GUI state.
+    fn poll_agent_events(&mut self) {
+        let bridge = match self.agent_bridge.as_mut() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Poll bridge events (non-blocking)
+        while let Ok(event) = bridge.event_rx.try_recv() {
+            match event {
+                AgentBridgeEvent::TextDelta(delta) => {
+                    self.gui_state.agent_streaming_text.push_str(&delta);
+                    self.dirty = true;
+                }
+                AgentBridgeEvent::ToolCallStart { tool_name, args_summary } => {
+                    // Flush any pending streaming text before the tool call
+                    if !self.gui_state.agent_streaming_text.is_empty() {
+                        let text = std::mem::take(&mut self.gui_state.agent_streaming_text);
+                        self.gui_state.agent_messages.push(AgentChatMessage {
+                            role: AgentChatRole::Assistant,
+                            content: text,
+                        });
+                    }
+                    self.gui_state.agent_messages.push(AgentChatMessage {
+                        role: AgentChatRole::ToolCall,
+                        content: format!("⚙ {tool_name}: {args_summary}"),
+                    });
+                    self.dirty = true;
+                }
+                AgentBridgeEvent::ToolCallEnd { tool_name, is_error } => {
+                    let status = if is_error { "✗" } else { "✓" };
+                    self.gui_state.agent_messages.push(AgentChatMessage {
+                        role: AgentChatRole::ToolCall,
+                        content: format!("{status} {tool_name} completed"),
+                    });
+                    self.dirty = true;
+                }
+                AgentBridgeEvent::Thinking(text) => {
+                    // Could display thinking separately; for now append to streaming
+                    self.gui_state.agent_streaming_text.push_str(&text);
+                    self.dirty = true;
+                }
+                AgentBridgeEvent::Done => {
+                    // Flush streaming text to a final assistant message
+                    if !self.gui_state.agent_streaming_text.is_empty() {
+                        let text = std::mem::take(&mut self.gui_state.agent_streaming_text);
+                        self.gui_state.agent_messages.push(AgentChatMessage {
+                            role: AgentChatRole::Assistant,
+                            content: text,
+                        });
+                    }
+                    self.gui_state.agent_is_running = false;
+                    self.dirty = true;
+                }
+                AgentBridgeEvent::Error(err) => {
+                    // Flush any partial streaming text
+                    if !self.gui_state.agent_streaming_text.is_empty() {
+                        let text = std::mem::take(&mut self.gui_state.agent_streaming_text);
+                        self.gui_state.agent_messages.push(AgentChatMessage {
+                            role: AgentChatRole::Assistant,
+                            content: text,
+                        });
+                    }
+                    self.gui_state.agent_messages.push(AgentChatMessage {
+                        role: AgentChatRole::Error,
+                        content: err,
+                    });
+                    self.gui_state.agent_is_running = false;
+                    self.dirty = true;
+                }
+            }
+        }
+
+        // Poll tool requests (non-blocking) and respond
+        while let Ok(req) = bridge.tool_request_rx.try_recv() {
+            match req {
+                ToolRequest::ExecuteCommand { command, pane_id, reply } => {
+                    let cmd = command.trim().replace('\r', "").replace('\n', " ");
+                    let pane = if let Some(id) = pane_id {
+                        self.tab_manager.panes.values_mut().nth(id)
+                    } else {
+                        self.tab_manager.focused_pane_mut()
+                    };
+                    if let Some(pane) = pane {
+                        // Shells expect CR ('\r') for Enter, NOT LF ('\n').
+                        // Sending '\n' triggers multi-line edit mode in PSReadLine / zsh ZLE /
+                        // bash readline with bracketed paste, so the command never executes.
+                        pane.write_to_pty(cmd.as_bytes());
+                        pane.write_to_pty(b"\r");
+                        let _ = reply.send(ToolResponse::Output("ok".into()));
+                    } else {
+                        let _ = reply.send(ToolResponse::Error("No active terminal pane".into()));
+                    }
+                    self.dirty = true;
+                }
+                ToolRequest::ReadTerminalOutput { pane_id, last_n_blocks: _, reply } => {
+                    let pane = if let Some(id) = pane_id {
+                        self.tab_manager.panes.values().nth(id)
+                    } else {
+                        self.tab_manager.focused_pane()
+                    };
+                    if let Some(pane) = pane {
+                        let grid = pane.terminal.grid();
+                        let output = grid.extract_visible_text_last_n_lines(100);
+                        let _ = reply.send(ToolResponse::Output(output));
+                    } else {
+                        let _ = reply.send(ToolResponse::Error("No active terminal pane".into()));
+                    }
+                }
+                ToolRequest::ReadSystemStatus { reply } => {
+                    // Try to find SSH pane with system status
+                    let status = self.tab_manager.focused_pane()
+                        .and_then(|p| p.server_status());
+                    if let Some(ss) = status {
+                        let _ = reply.send(ToolResponse::Output(format!(
+                            "OS: {} | Kernel: {} | Host: {}\nUptime: {} | Load: {}\nCPU: {:.1}% | Memory: {}/{} MB\nDisk: {}",
+                            ss.os, ss.kernel, ss.hostname,
+                            ss.uptime, ss.load_avg,
+                            ss.cpu_usage_pct, ss.mem_used_mb, ss.mem_total_mb,
+                            ss.disk_usage,
+                        )));
+                    } else {
+                        let _ = reply.send(ToolResponse::Error(
+                            "System status not available (only for SSH sessions with status probe)".into()
+                        ));
+                    }
+                }
             }
         }
     }
@@ -464,11 +632,161 @@ impl App {
                 self.gui_state.show_find_bar = !self.gui_state.show_find_bar;
                 self.relayout();
             }
+            GuiAction::EditSavedProfile(idx) => {
+                if let Some(profile) = self.stored_profiles.get(idx) {
+                    self.gui_state.ssh_editing_profile_id = Some(profile.id.to_string());
+                    self.gui_state.ssh_name = profile.name.clone();
+                    self.gui_state.ssh_host = profile.host.clone();
+                    self.gui_state.ssh_port = profile.port.to_string();
+                    self.gui_state.ssh_username = profile.username.clone();
+                    self.gui_state.ssh_group = profile.group.clone().unwrap_or_else(|| "Default".to_string());
+                    match &profile.auth {
+                        nexterm_ssh::AuthMethod::Password(p) => {
+                            self.gui_state.ssh_auth_mode = 0;
+                            self.gui_state.ssh_password = p.clone();
+                            self.gui_state.ssh_key_path.clear();
+                        }
+                        nexterm_ssh::AuthMethod::PublicKey { key_path, .. } => {
+                            self.gui_state.ssh_auth_mode = 1;
+                            self.gui_state.ssh_key_path = key_path.clone();
+                            self.gui_state.ssh_password.clear();
+                        }
+                        _ => {
+                            self.gui_state.ssh_auth_mode = 1;
+                            self.gui_state.ssh_password.clear();
+                            self.gui_state.ssh_key_path.clear();
+                        }
+                    }
+                    self.gui_state.show_ssh_dialog = true;
+                }
+            }
+            GuiAction::UpdateProfile { id, name, group, host, port, username, auth_mode, password, key_path } => {
+                let auth = if auth_mode == 0 {
+                    nexterm_ssh::AuthMethod::Password(password)
+                } else {
+                    nexterm_ssh::AuthMethod::PublicKey {
+                        key_path,
+                        passphrase: None,
+                    }
+                };
+                // Find and update the existing profile
+                if let Some(pos) = self.stored_profiles.iter().position(|p| p.id.to_string() == id) {
+                    self.stored_profiles[pos].name = name;
+                    self.stored_profiles[pos].host = host;
+                    self.stored_profiles[pos].port = port;
+                    self.stored_profiles[pos].username = username;
+                    self.stored_profiles[pos].auth = auth;
+                    self.stored_profiles[pos].group = Some(group);
+                    if let Err(e) = self.session_store.save_profile(&self.stored_profiles[pos]) {
+                        error!("failed to update profile: {e}");
+                    }
+                    self.sync_gui_profiles();
+                }
+            }
+            GuiAction::ImportSshConfig => {
+                let home = dirs::home_dir().unwrap_or_default();
+                let config_path = home.join(".ssh").join("config");
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    let entries = nexterm_ssh::config_parser::parse_ssh_config(&content);
+                    let mut imported = 0;
+                    for entry in entries {
+                        // Skip wildcard patterns
+                        if entry.host_pattern.contains('*') || entry.host_pattern.contains('?') {
+                            continue;
+                        }
+                        // Skip if already exists (same host pattern)
+                        let hostname = entry.hostname.as_deref().unwrap_or(&entry.host_pattern);
+                        if self.stored_profiles.iter().any(|p| p.host == hostname && p.name == entry.host_pattern) {
+                            continue;
+                        }
+                        let auth = if let Some(key) = &entry.identity_file {
+                            let expanded = if key.starts_with("~/") {
+                                home.join(&key[2..]).to_string_lossy().to_string()
+                            } else {
+                                key.clone()
+                            };
+                            nexterm_ssh::AuthMethod::PublicKey { key_path: expanded, passphrase: None }
+                        } else {
+                            nexterm_ssh::AuthMethod::Agent
+                        };
+                        let profile = nexterm_ssh::SshProfile {
+                            name: entry.host_pattern.clone(),
+                            host: hostname.to_string(),
+                            port: entry.port.unwrap_or(22),
+                            username: entry.user.unwrap_or_else(|| "root".to_string()),
+                            auth,
+                            group: Some("SSH Config".to_string()),
+                            ..Default::default()
+                        };
+                        if let Err(e) = self.session_store.save_profile(&profile) {
+                            error!("failed to save imported profile: {e}");
+                        }
+                        self.stored_profiles.push(profile);
+                        imported += 1;
+                    }
+                    info!(imported, "imported profiles from ~/.ssh/config");
+                    self.sync_gui_profiles();
+                } else {
+                    warn!("could not read ~/.ssh/config");
+                }
+            }
+            // ─── Agent ───
+            GuiAction::ToggleAgentPanel => {
+                self.gui_state.show_agent_panel = !self.gui_state.show_agent_panel;
+                if self.gui_state.show_agent_panel {
+                    self.ensure_agent_bridge();
+                }
+                self.relayout();
+            }
+            GuiAction::AgentSendMessage(msg) => {
+                self.ensure_agent_bridge();
+                if let Some(ref bridge) = self.agent_bridge {
+                    // Gather terminal context from focused pane
+                    let terminal_context = self.tab_manager.focused_pane()
+                        .map(|p| p.terminal.grid().extract_visible_text_last_n_lines(30));
+                    let _ = bridge.command_tx.try_send(AgentBridgeCommand::Query {
+                        message: msg,
+                        terminal_context,
+                    });
+                }
+            }
+            GuiAction::AgentCancel => {
+                if let Some(ref bridge) = self.agent_bridge {
+                    let _ = bridge.command_tx.try_send(AgentBridgeCommand::Cancel);
+                }
+                self.gui_state.agent_is_running = false;
+            }
+            GuiAction::AgentReset => {
+                if let Some(ref bridge) = self.agent_bridge {
+                    let _ = bridge.command_tx.try_send(AgentBridgeCommand::Reset);
+                }
+                self.gui_state.agent_messages.clear();
+                self.gui_state.agent_streaming_text.clear();
+                self.gui_state.agent_is_running = false;
+            }
+            GuiAction::AgentConfigure { provider_type, base_url, api_key, model_id } => {
+                // Persist to config file
+                self.config.ai.provider = provider_type.clone();
+                self.config.ai.base_url = base_url.clone();
+                self.config.ai.api_key = api_key.clone();
+                self.config.ai.model = model_id.clone();
+                if let Err(e) = nexterm_config::save_config(&self.config_path, &self.config) {
+                    error!("failed to save AI config: {e}");
+                }
+                // Forward to running bridge
+                if let Some(ref bridge) = self.agent_bridge {
+                    let _ = bridge.command_tx.try_send(AgentBridgeCommand::Configure {
+                        provider_type,
+                        base_url,
+                        api_key,
+                        model_id,
+                    });
+                }
+            }
             // Stubs for features to be implemented
             GuiAction::SelectAll
             | GuiAction::DuplicateTab
             | GuiAction::ShowAbout
-            | GuiAction::EditSavedProfile(_)
             | GuiAction::RenameTab(_, _)
             | GuiAction::DisconnectTab(_)
             | GuiAction::ReconnectTab(_)
@@ -550,7 +868,8 @@ impl App {
             GuiAction::ExecHistoryCommand(cmd) => {
                 if let Some(pane) = self.tab_manager.focused_pane_mut() {
                     pane.write_to_pty(cmd.as_bytes());
-                    pane.write_to_pty(b"\n");
+                    // Use CR, not LF — see ExecuteCommand comment above.
+                    pane.write_to_pty(b"\r");
                 }
                 self.gui_state.show_history_panel = false;
             }
@@ -1011,6 +1330,9 @@ impl ApplicationHandler for App {
             self.dirty = true;
         }
 
+        // Poll Agent bridge events
+        self.poll_agent_events();
+
         // Continuous auto-scroll while drag-selecting and mouse is held outside
         if self.mouse_pressed && !self.gui_state.scrollbar_dragging {
             if let Some(pane_id) = self.tab_manager.focused_pane_id() {
@@ -1096,6 +1418,58 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+
+        // Set window icon from embedded PNG
+        {
+            static ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
+            if let Ok(img) = image::load_from_memory(ICON_PNG) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                // Windows & Linux: set taskbar/window icon
+                if let Ok(icon) = winit::window::Icon::from_rgba(rgba.clone().into_raw(), w, h) {
+                    window.set_window_icon(Some(icon));
+                }
+                // macOS: set Dock icon via NSApplication setApplicationIconImage
+                #[cfg(target_os = "macos")]
+                {
+                    unsafe {
+                        use std::ffi::c_void;
+                        unsafe extern "C" {
+                            fn objc_getClass(name: *const u8) -> *mut c_void;
+                            fn objc_msgSend(obj: *mut c_void, sel: *mut c_void, ...) -> *mut c_void;
+                            fn sel_registerName(name: *const u8) -> *mut c_void;
+                        }
+
+                        // Use the original PNG bytes directly for NSImage
+                        let ns_data_class = objc_getClass(b"NSData\0".as_ptr());
+                        let sel_data = sel_registerName(b"dataWithBytes:length:\0".as_ptr());
+                        let ns_data = objc_msgSend(
+                            ns_data_class,
+                            sel_data,
+                            ICON_PNG.as_ptr() as *const c_void,
+                            ICON_PNG.len(),
+                        );
+
+                        // [[NSImage alloc] initWithData:]
+                        let ns_image_class = objc_getClass(b"NSImage\0".as_ptr());
+                        let sel_alloc = sel_registerName(b"alloc\0".as_ptr());
+                        let sel_init_data = sel_registerName(b"initWithData:\0".as_ptr());
+                        let ns_image = objc_msgSend(ns_image_class, sel_alloc);
+                        let ns_image = objc_msgSend(ns_image, sel_init_data, ns_data);
+
+                        if !ns_image.is_null() {
+                            // [NSApplication sharedApplication]
+                            let ns_app_class = objc_getClass(b"NSApplication\0".as_ptr());
+                            let sel_shared = sel_registerName(b"sharedApplication\0".as_ptr());
+                            let ns_app = objc_msgSend(ns_app_class, sel_shared);
+                            // [app setApplicationIconImage:image]
+                            let sel_set_icon = sel_registerName(b"setApplicationIconImage:\0".as_ptr());
+                            objc_msgSend(ns_app, sel_set_icon, ns_image);
+                        }
+                    }
+                }
+            }
+        }
 
         // Enable IME (Input Method Editor) for CJK input
         window.set_ime_allowed(true);
@@ -1467,6 +1841,7 @@ impl ApplicationHandler for App {
                                                 name: p.name.clone(),
                                                 cpu_pct: p.cpu_pct,
                                                 mem_str: p.mem_str.clone(),
+                                                mem_kb: p.mem_kb,
                                             }).collect(),
                                         }
                                     })

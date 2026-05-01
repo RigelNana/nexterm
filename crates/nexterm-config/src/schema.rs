@@ -203,6 +203,8 @@ impl Default for SftpConfig {
 pub struct AiConfig {
     pub provider: String,
     pub model: String,
+    pub base_url: String,
+    pub api_key: String,
     pub api_key_env: String,
     pub ambient_agent: bool,
     pub auto_suggest: bool,
@@ -212,8 +214,10 @@ pub struct AiConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            provider: "deepseek".into(),
-            model: "deepseek-v4-flash".into(),
+            provider: "openai".into(),
+            model: "deepseek-chat".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            api_key: String::new(),
             api_key_env: "NEXTERM_AI_KEY".into(),
             ambient_agent: true,
             auto_suggest: true,

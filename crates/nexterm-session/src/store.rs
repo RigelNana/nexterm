@@ -15,7 +15,7 @@ impl SessionStore {
     /// Open (or create) the session database at the given path.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
@@ -28,8 +28,7 @@ impl SessionStore {
                 id          TEXT PRIMARY KEY,
                 name        TEXT NOT NULL,
                 parent_id   TEXT,
-                sort_order  INTEGER DEFAULT 0,
-                FOREIGN KEY (parent_id) REFERENCES session_groups(id)
+                sort_order  INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS ssh_profiles (
@@ -44,12 +43,54 @@ impl SessionStore {
                 keepalive   INTEGER DEFAULT 30,
                 tags_json   TEXT,
                 group_id    TEXT,
-                sort_order  INTEGER DEFAULT 0,
-                FOREIGN KEY (group_id) REFERENCES session_groups(id)
+                sort_order  INTEGER DEFAULT 0
             );
             ",
         )?;
+        // Migrate: if the old table had FK constraints, recreate without them.
+        // This is safe because SQLite CREATE TABLE IF NOT EXISTS won't touch existing tables,
+        // but we check and fix FK issues by attempting a dummy insert/rollback.
+        self.migrate_remove_fk()?;
         info!("session store schema initialized");
+        Ok(())
+    }
+
+    /// Migrate old tables that had FOREIGN KEY constraints to new schema without FK.
+    /// SQLite doesn't support ALTER TABLE DROP CONSTRAINT, so we recreate the table.
+    fn migrate_remove_fk(&self) -> Result<()> {
+        // Check if the existing table has FK constraints by inspecting the schema SQL
+        let sql: Option<String> = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ssh_profiles'",
+            [],
+            |row| row.get(0),
+        ).ok();
+        if let Some(sql) = sql {
+            if sql.contains("FOREIGN KEY") {
+                info!("migrating ssh_profiles: removing FK constraints");
+                self.conn.execute_batch(
+                    "
+                    ALTER TABLE ssh_profiles RENAME TO _ssh_profiles_old;
+                    CREATE TABLE ssh_profiles (
+                        id          TEXT PRIMARY KEY,
+                        name        TEXT NOT NULL,
+                        host        TEXT NOT NULL,
+                        port        INTEGER DEFAULT 22,
+                        username    TEXT NOT NULL,
+                        auth_json   TEXT NOT NULL,
+                        proxy_jump  TEXT,
+                        env_json    TEXT,
+                        keepalive   INTEGER DEFAULT 30,
+                        tags_json   TEXT,
+                        group_id    TEXT,
+                        sort_order  INTEGER DEFAULT 0
+                    );
+                    INSERT INTO ssh_profiles SELECT * FROM _ssh_profiles_old;
+                    DROP TABLE _ssh_profiles_old;
+                    ",
+                )?;
+                info!("migration complete");
+            }
+        }
         Ok(())
     }
 

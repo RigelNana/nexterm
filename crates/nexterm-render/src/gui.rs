@@ -133,6 +133,36 @@ pub enum GuiAction {
     ToggleHistoryPanel,
     /// Refresh the cached history list from the database.
     RefreshHistory,
+    /// Import profiles from ~/.ssh/config.
+    ImportSshConfig,
+    /// Update an existing saved profile by its UUID string.
+    UpdateProfile {
+        id: String,
+        name: String,
+        group: String,
+        host: String,
+        port: u16,
+        username: String,
+        auth_mode: usize,
+        password: String,
+        key_path: String,
+    },
+    // ─── Agent ───
+    /// Toggle the Agent chat panel.
+    ToggleAgentPanel,
+    /// Send a message to the Agent.
+    AgentSendMessage(String),
+    /// Cancel the current agent run.
+    AgentCancel,
+    /// Reset agent conversation.
+    AgentReset,
+    /// Configure agent (provider_type, base_url, api_key, model_id).
+    AgentConfigure {
+        provider_type: String,
+        base_url: String,
+        api_key: String,
+        model_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +319,28 @@ pub struct ProcessSnapshot {
     pub name: String,
     pub cpu_pct: f32,
     pub mem_str: String,
+    /// Raw RSS in KB for sorting.
+    pub mem_kb: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Agent chat messages (GUI-side)
+// ---------------------------------------------------------------------------
+
+/// Role in the agent conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentChatRole {
+    User,
+    Assistant,
+    ToolCall,
+    Error,
+}
+
+/// A single message in the Agent chat panel.
+#[derive(Debug, Clone)]
+pub struct AgentChatMessage {
+    pub role: AgentChatRole,
+    pub content: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +364,12 @@ pub struct GuiState {
     pub sftp_new_name: String,
     /// Selected network interface index for the system panel (None = aggregate all).
     pub selected_net_if: Option<usize>,
+    /// Process sort column: 0 = CPU (default), 1 = Memory.
+    pub proc_sort_col: u8,
+    /// Process sort ascending (false = descending, default).
+    pub proc_sort_asc: bool,
+    /// UUID of the profile currently being edited (None = creating new).
+    pub ssh_editing_profile_id: Option<String>,
     /// Detected available shells on the system.
     pub available_shells: Vec<ShellInfo>,
 
@@ -381,6 +439,19 @@ pub struct GuiState {
     pub show_history_panel: bool,
     pub history_search: String,
     pub history_entries: Vec<HistoryItem>,
+
+    // Agent panel
+    pub show_agent_panel: bool,
+    pub agent_input: String,
+    pub agent_messages: Vec<AgentChatMessage>,
+    pub agent_is_running: bool,
+    /// Accumulated streaming text for the current assistant response.
+    pub agent_streaming_text: String,
+    /// Agent configuration fields (shown in settings).
+    pub agent_provider_type: String,
+    pub agent_base_url: String,
+    pub agent_api_key: String,
+    pub agent_model_id: String,
 }
 
 impl GuiState {
@@ -397,6 +468,9 @@ impl GuiState {
             sftp_path_input: String::new(),
             sftp_new_name: String::new(),
             selected_net_if: None,
+            proc_sort_col: 0,
+            proc_sort_asc: false,
+            ssh_editing_profile_id: None,
             available_shells: Vec::new(),
 
             terminal_mode: TerminalDisplayMode::Normal,
@@ -447,6 +521,16 @@ impl GuiState {
             show_history_panel: false,
             history_search: String::new(),
             history_entries: Vec::new(),
+
+            show_agent_panel: false,
+            agent_input: String::new(),
+            agent_messages: Vec::new(),
+            agent_is_running: false,
+            agent_streaming_text: String::new(),
+            agent_provider_type: "openai".to_string(),
+            agent_base_url: "https://api.deepseek.com/v1".to_string(),
+            agent_api_key: String::new(),
+            agent_model_id: "deepseek-chat".to_string(),
         }
     }
 
@@ -544,6 +628,11 @@ pub fn draw_gui(
     // History panel (right sidebar) — draw before system panel
     if state.show_history_panel {
         draw_history_panel(ctx, state, &mut actions);
+    }
+
+    // Agent panel (right sidebar)
+    if state.show_agent_panel {
+        draw_agent_panel(ctx, state, &mut actions);
     }
 
     // System status panel (right side, SSH only) — draw BEFORE SFTP so it claims
@@ -935,6 +1024,10 @@ fn draw_toolbar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gui
                     if toolbar_icon_btn(ui, "*", "设置  Ctrl+,") {
                         state.show_settings = !state.show_settings;
                     }
+                    let agent_label = if state.show_agent_panel { "AI*" } else { "AI" };
+                    if toolbar_icon_btn(ui, agent_label, "AI Agent 面板") {
+                        actions.push(GuiAction::ToggleAgentPanel);
+                    }
                     let hist_label = if state.show_history_panel { "HIST*" } else { "HIST" };
                     if toolbar_icon_btn(ui, hist_label, "命令历史  Ctrl+R") {
                         actions.push(GuiAction::ToggleHistoryPanel);
@@ -1265,7 +1358,27 @@ fn draw_session_panel(
                         .on_hover_text("New SSH session")
                         .clicked()
                     {
+                        state.ssh_editing_profile_id = None;
+                        state.ssh_name.clear();
+                        state.ssh_host.clear();
+                        state.ssh_port = "22".to_string();
+                        state.ssh_username.clear();
+                        state.ssh_password.clear();
+                        state.ssh_key_path.clear();
+                        state.ssh_auth_mode = 0;
+                        state.ssh_group = "Default".to_string();
                         state.show_ssh_dialog = true;
+                    }
+                    let import_btn = egui::Button::new(
+                        egui::RichText::new("↓").size(14.0),
+                    )
+                    .min_size(egui::vec2(22.0, 22.0));
+                    if ui
+                        .add(import_btn)
+                        .on_hover_text("Import from ~/.ssh/config")
+                        .clicked()
+                    {
+                        actions.push(GuiAction::ImportSshConfig);
                     }
                 });
             });
@@ -1934,7 +2047,9 @@ fn draw_settings_keyboard(ui: &mut egui::Ui) {
 
 fn draw_ssh_dialog(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<GuiAction>) {
     let mut open = true;
-    egui::Window::new("New SSH Connection")
+    let is_editing = state.ssh_editing_profile_id.is_some();
+    let dialog_title = if is_editing { "Edit SSH Connection" } else { "New SSH Connection" };
+    egui::Window::new(dialog_title)
         .open(&mut open)
         .default_width(440.0)
         .resizable(true)
@@ -2008,76 +2123,119 @@ fn draw_ssh_dialog(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Connect").clicked() {
-                    let port = state.ssh_port.parse::<u16>().unwrap_or(22);
-                    let auth = if state.ssh_auth_mode == 0 {
-                        SshAuthInput::Password(state.ssh_password.clone())
-                    } else {
-                        SshAuthInput::KeyFile(state.ssh_key_path.clone())
-                    };
-                    actions.push(GuiAction::ConnectSsh {
-                        host: state.ssh_host.clone(),
-                        port,
-                        username: state.ssh_username.clone(),
-                        auth,
-                    });
-                }
-                if ui.button("Save & Connect").clicked() {
-                    let port = state.ssh_port.parse::<u16>().unwrap_or(22);
-                    let name = if state.ssh_name.is_empty() {
-                        format!("{}@{}", state.ssh_username, state.ssh_host)
-                    } else {
-                        state.ssh_name.clone()
-                    };
-                    actions.push(GuiAction::SaveProfile {
-                        name,
-                        group: state.ssh_group.clone(),
-                        host: state.ssh_host.clone(),
-                        port,
-                        username: state.ssh_username.clone(),
-                        auth_mode: state.ssh_auth_mode,
-                        password: state.ssh_password.clone(),
-                        key_path: state.ssh_key_path.clone(),
-                    });
-                    let auth = if state.ssh_auth_mode == 0 {
-                        SshAuthInput::Password(state.ssh_password.clone())
-                    } else {
-                        SshAuthInput::KeyFile(state.ssh_key_path.clone())
-                    };
-                    actions.push(GuiAction::ConnectSsh {
-                        host: state.ssh_host.clone(),
-                        port,
-                        username: state.ssh_username.clone(),
-                        auth,
-                    });
-                    state.show_ssh_dialog = false;
-                }
-                if ui.button("Save").clicked() {
-                    let port = state.ssh_port.parse::<u16>().unwrap_or(22);
-                    let name = if state.ssh_name.is_empty() {
-                        format!("{}@{}", state.ssh_username, state.ssh_host)
-                    } else {
-                        state.ssh_name.clone()
-                    };
-                    actions.push(GuiAction::SaveProfile {
-                        name,
-                        group: state.ssh_group.clone(),
-                        host: state.ssh_host.clone(),
-                        port,
-                        username: state.ssh_username.clone(),
-                        auth_mode: state.ssh_auth_mode,
-                        password: state.ssh_password.clone(),
-                        key_path: state.ssh_key_path.clone(),
-                    });
-                    state.show_ssh_dialog = false;
+                let port = state.ssh_port.parse::<u16>().unwrap_or(22);
+                let name = if state.ssh_name.is_empty() {
+                    format!("{}@{}", state.ssh_username, state.ssh_host)
+                } else {
+                    state.ssh_name.clone()
+                };
+
+                if is_editing {
+                    // ── Edit mode ──
+                    let editing_id = state.ssh_editing_profile_id.clone().unwrap();
+                    if ui.button("Update & Connect").clicked() {
+                        actions.push(GuiAction::UpdateProfile {
+                            id: editing_id.clone(),
+                            name: name.clone(),
+                            group: state.ssh_group.clone(),
+                            host: state.ssh_host.clone(),
+                            port,
+                            username: state.ssh_username.clone(),
+                            auth_mode: state.ssh_auth_mode,
+                            password: state.ssh_password.clone(),
+                            key_path: state.ssh_key_path.clone(),
+                        });
+                        let auth = if state.ssh_auth_mode == 0 {
+                            SshAuthInput::Password(state.ssh_password.clone())
+                        } else {
+                            SshAuthInput::KeyFile(state.ssh_key_path.clone())
+                        };
+                        actions.push(GuiAction::ConnectSsh {
+                            host: state.ssh_host.clone(),
+                            port,
+                            username: state.ssh_username.clone(),
+                            auth,
+                        });
+                        state.show_ssh_dialog = false;
+                        state.ssh_editing_profile_id = None;
+                    }
+                    if ui.button("Update").clicked() {
+                        actions.push(GuiAction::UpdateProfile {
+                            id: editing_id,
+                            name,
+                            group: state.ssh_group.clone(),
+                            host: state.ssh_host.clone(),
+                            port,
+                            username: state.ssh_username.clone(),
+                            auth_mode: state.ssh_auth_mode,
+                            password: state.ssh_password.clone(),
+                            key_path: state.ssh_key_path.clone(),
+                        });
+                        state.show_ssh_dialog = false;
+                        state.ssh_editing_profile_id = None;
+                    }
+                } else {
+                    // ── New mode ──
+                    if ui.button("Connect").clicked() {
+                        let auth = if state.ssh_auth_mode == 0 {
+                            SshAuthInput::Password(state.ssh_password.clone())
+                        } else {
+                            SshAuthInput::KeyFile(state.ssh_key_path.clone())
+                        };
+                        actions.push(GuiAction::ConnectSsh {
+                            host: state.ssh_host.clone(),
+                            port,
+                            username: state.ssh_username.clone(),
+                            auth,
+                        });
+                    }
+                    if ui.button("Save & Connect").clicked() {
+                        actions.push(GuiAction::SaveProfile {
+                            name: name.clone(),
+                            group: state.ssh_group.clone(),
+                            host: state.ssh_host.clone(),
+                            port,
+                            username: state.ssh_username.clone(),
+                            auth_mode: state.ssh_auth_mode,
+                            password: state.ssh_password.clone(),
+                            key_path: state.ssh_key_path.clone(),
+                        });
+                        let auth = if state.ssh_auth_mode == 0 {
+                            SshAuthInput::Password(state.ssh_password.clone())
+                        } else {
+                            SshAuthInput::KeyFile(state.ssh_key_path.clone())
+                        };
+                        actions.push(GuiAction::ConnectSsh {
+                            host: state.ssh_host.clone(),
+                            port,
+                            username: state.ssh_username.clone(),
+                            auth,
+                        });
+                        state.show_ssh_dialog = false;
+                    }
+                    if ui.button("Save").clicked() {
+                        actions.push(GuiAction::SaveProfile {
+                            name,
+                            group: state.ssh_group.clone(),
+                            host: state.ssh_host.clone(),
+                            port,
+                            username: state.ssh_username.clone(),
+                            auth_mode: state.ssh_auth_mode,
+                            password: state.ssh_password.clone(),
+                            key_path: state.ssh_key_path.clone(),
+                        });
+                        state.show_ssh_dialog = false;
+                    }
                 }
                 if ui.button("Cancel").clicked() {
                     state.show_ssh_dialog = false;
+                    state.ssh_editing_profile_id = None;
                 }
             });
         });
     if !open {
         state.show_ssh_dialog = false;
+        state.ssh_editing_profile_id = None;
     }
 }
 
@@ -2792,6 +2950,34 @@ fn fmt_rate(bps: f64) -> String {
     }
 }
 
+/// Reformat a df -h size string to ensure G/T values have 2 decimal places.
+/// e.g. "1.2T" → "1.20T", "500G" → "500.00G", "100M" → "100M" (unchanged).
+fn fmt_disk_size(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return s.to_string();
+    }
+    let last = s.as_bytes()[s.len() - 1];
+    if last == b'T' || last == b'G' {
+        let num_str = &s[..s.len() - 1];
+        if let Ok(val) = num_str.parse::<f64>() {
+            return format!("{:.2}{}", val, last as char);
+        }
+    }
+    s.to_string()
+}
+
+/// Format a memory value in MB into human-readable string with 2 decimal places.
+fn fmt_mem_mb(mb: u64) -> String {
+    if mb >= 1_048_576 {
+        format!("{:.2} TB", mb as f64 / 1_048_576.0)
+    } else if mb >= 1024 {
+        format!("{:.2} GB", mb as f64 / 1024.0)
+    } else {
+        format!("{} MB", mb)
+    }
+}
+
 fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatusSnapshot) {
     let panel_width = 270.0;
     let bg = egui::Color32::from_rgb(248, 248, 248);
@@ -2806,7 +2992,10 @@ fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatu
     let bar_bg = egui::Color32::from_rgb(225, 225, 225);
 
     egui::SidePanel::right("system_panel")
-        .exact_width(panel_width)
+        .default_width(panel_width)
+        .min_width(200.0)
+        .max_width(500.0)
+        .resizable(true)
         .frame(egui::Frame::new().fill(bg).inner_margin(egui::Margin::same(8)))
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2857,7 +3046,7 @@ fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatu
                         if fill_w > 0.0 {
                             ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_h)), 2.0, mem_color);
                         }
-                        ui.label(egui::RichText::new(format!("{}/{}M", ss.mem_used_mb, ss.mem_total_mb)).small().color(mem_color));
+                        ui.label(egui::RichText::new(format!("{}/{}", fmt_mem_mb(ss.mem_used_mb), fmt_mem_mb(ss.mem_total_mb))).small().color(mem_color));
                     });
                     ui.end_row();
 
@@ -2899,7 +3088,7 @@ fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatu
                         for d in &ss.disks {
                             ui.label(egui::RichText::new(&d.mount).small().color(value_color));
                             ui.label(egui::RichText::new(&d.fstype).small().color(label_color));
-                            ui.label(egui::RichText::new(format!("{}/{}", d.used, d.total)).small().color(label_color));
+                            ui.label(egui::RichText::new(format!("{}/{}", fmt_disk_size(&d.used), fmt_disk_size(&d.total))).small().color(label_color));
                             let pct_num: f32 = d.use_pct.trim_end_matches('%').parse().unwrap_or(0.0);
                             let pct_color = if pct_num > 90.0 { red } else if pct_num > 70.0 { yellow } else { green };
                             ui.label(egui::RichText::new(&d.use_pct).small().color(pct_color));
@@ -3016,16 +3205,56 @@ fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatu
                 ui.add_space(4.0);
                 ui.separator();
                 ui.label(egui::RichText::new("Top Processes").size(11.0).strong().color(value_color));
+
+                // Sort processes
+                let mut sorted_procs: Vec<&ProcessSnapshot> = ss.top_procs.iter().collect();
+                match state.proc_sort_col {
+                    1 => {
+                        // Sort by memory
+                        if state.proc_sort_asc {
+                            sorted_procs.sort_by(|a, b| a.mem_kb.cmp(&b.mem_kb));
+                        } else {
+                            sorted_procs.sort_by(|a, b| b.mem_kb.cmp(&a.mem_kb));
+                        }
+                    }
+                    _ => {
+                        // Sort by CPU (default)
+                        if state.proc_sort_asc {
+                            sorted_procs.sort_by(|a, b| a.cpu_pct.partial_cmp(&b.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+                        } else {
+                            sorted_procs.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+                        }
+                    }
+                }
+
+                let arrow = if state.proc_sort_asc { " ▲" } else { " ▼" };
                 egui::Grid::new("proc_grid")
                     .num_columns(3)
                     .spacing([6.0, 1.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Mem").small().strong().color(label_color));
-                        ui.label(egui::RichText::new("CPU").small().strong().color(label_color));
+                        // Clickable column headers
+                        let mem_label = if state.proc_sort_col == 1 { format!("Mem{arrow}") } else { "Mem".to_string() };
+                        let cpu_label = if state.proc_sort_col == 0 { format!("CPU{arrow}") } else { "CPU".to_string() };
+                        if ui.add(egui::Label::new(egui::RichText::new(mem_label).small().strong().color(label_color)).sense(egui::Sense::click())).clicked() {
+                            if state.proc_sort_col == 1 {
+                                state.proc_sort_asc = !state.proc_sort_asc;
+                            } else {
+                                state.proc_sort_col = 1;
+                                state.proc_sort_asc = false;
+                            }
+                        }
+                        if ui.add(egui::Label::new(egui::RichText::new(cpu_label).small().strong().color(label_color)).sense(egui::Sense::click())).clicked() {
+                            if state.proc_sort_col == 0 {
+                                state.proc_sort_asc = !state.proc_sort_asc;
+                            } else {
+                                state.proc_sort_col = 0;
+                                state.proc_sort_asc = false;
+                            }
+                        }
                         ui.label(egui::RichText::new("Command").small().strong().color(label_color));
                         ui.end_row();
-                        for p in &ss.top_procs {
+                        for p in &sorted_procs {
                             ui.label(egui::RichText::new(&p.mem_str).small().color(value_color));
                             let cpu_color = if p.cpu_pct > 50.0 { red } else if p.cpu_pct > 10.0 { yellow } else { green };
                             ui.label(egui::RichText::new(format!("{:.1}", p.cpu_pct)).small().color(cpu_color));
@@ -3035,5 +3264,199 @@ fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatu
                     });
             }
             }); // ScrollArea
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Agent panel — right sidebar with chat UI
+// ---------------------------------------------------------------------------
+
+const AGENT_PANEL_WIDTH: f32 = 340.0;
+
+fn draw_agent_panel(
+    ctx: &egui::Context,
+    state: &mut GuiState,
+    actions: &mut Vec<GuiAction>,
+) {
+    egui::SidePanel::right("agent_panel")
+        .resizable(true)
+        .default_width(AGENT_PANEL_WIDTH)
+        .min_width(260.0)
+        .max_width(600.0)
+        .show(ctx, |ui| {
+            // ── Header ──
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new("AI Agent").size(14.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").clicked() {
+                        actions.push(GuiAction::ToggleAgentPanel);
+                    }
+                    if ui.small_button("↺").on_hover_text("重置对话").clicked() {
+                        actions.push(GuiAction::AgentReset);
+                    }
+                });
+            });
+            ui.separator();
+
+            // ── Config section (collapsible) ──
+            egui::CollapsingHeader::new(egui::RichText::new("配置").size(11.0))
+                .default_open(state.agent_api_key.is_empty())
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Provider").size(11.0));
+                        egui::ComboBox::from_id_salt("agent_provider")
+                            .width(100.0)
+                            .selected_text(&state.agent_provider_type)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut state.agent_provider_type, "openai".into(), "OpenAI");
+                                ui.selectable_value(&mut state.agent_provider_type, "anthropic".into(), "Anthropic");
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Base URL").size(11.0));
+                        ui.add(egui::TextEdit::singleline(&mut state.agent_base_url)
+                            .desired_width(180.0)
+                            .font(egui::TextStyle::Small));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("API Key ").size(11.0));
+                        ui.add(egui::TextEdit::singleline(&mut state.agent_api_key)
+                            .desired_width(180.0)
+                            .password(true)
+                            .font(egui::TextStyle::Small));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Model   ").size(11.0));
+                        ui.add(egui::TextEdit::singleline(&mut state.agent_model_id)
+                            .desired_width(180.0)
+                            .font(egui::TextStyle::Small));
+                    });
+                    if ui.small_button("应用配置").clicked() {
+                        actions.push(GuiAction::AgentConfigure {
+                            provider_type: state.agent_provider_type.clone(),
+                            base_url: state.agent_base_url.clone(),
+                            api_key: state.agent_api_key.clone(),
+                            model_id: state.agent_model_id.clone(),
+                        });
+                    }
+                });
+            ui.separator();
+
+            // ── Chat messages area ──
+            let available = ui.available_height() - 40.0; // reserve space for input
+            egui::ScrollArea::vertical()
+                .max_height(available.max(100.0))
+                .auto_shrink([false; 2])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    if state.agent_messages.is_empty() && state.agent_streaming_text.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label(
+                                egui::RichText::new("向 AI Agent 提问\n它可以在你的终端中执行命令")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_gray(120)),
+                            );
+                        });
+                    }
+
+                    for msg in &state.agent_messages {
+                        draw_agent_message(ui, msg);
+                    }
+
+                    // Show streaming text if agent is running
+                    if !state.agent_streaming_text.is_empty() {
+                        draw_agent_message(ui, &AgentChatMessage {
+                            role: AgentChatRole::Assistant,
+                            content: state.agent_streaming_text.clone(),
+                        });
+                    }
+
+                    if state.agent_is_running && state.agent_streaming_text.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("思考中...").size(11.0).italics());
+                        });
+                    }
+                });
+
+            // ── Input bar ──
+            ui.separator();
+            ui.horizontal(|ui| {
+                let input_response = ui.add(
+                    egui::TextEdit::singleline(&mut state.agent_input)
+                        .desired_width(ui.available_width() - 60.0)
+                        .hint_text("输入消息...")
+                        .font(egui::TextStyle::Body),
+                );
+                let enter_pressed = input_response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let send_clicked = if state.agent_is_running {
+                    ui.add_enabled(true, egui::Button::new("取消"))
+                        .clicked()
+                } else {
+                    ui.add_enabled(
+                        !state.agent_input.trim().is_empty(),
+                        egui::Button::new("发送"),
+                    )
+                    .clicked()
+                };
+
+                if state.agent_is_running && send_clicked {
+                    actions.push(GuiAction::AgentCancel);
+                } else if !state.agent_is_running
+                    && (send_clicked || enter_pressed)
+                    && !state.agent_input.trim().is_empty()
+                {
+                    let msg = state.agent_input.trim().to_string();
+                    state.agent_messages.push(AgentChatMessage {
+                        role: AgentChatRole::User,
+                        content: msg.clone(),
+                    });
+                    state.agent_input.clear();
+                    state.agent_is_running = true;
+                    actions.push(GuiAction::AgentSendMessage(msg));
+                    // Re-focus input
+                    input_response.request_focus();
+                }
+            });
+        });
+}
+
+fn draw_agent_message(ui: &mut egui::Ui, msg: &AgentChatMessage) {
+    let (prefix, color, bg) = match msg.role {
+        AgentChatRole::User => (
+            "You",
+            egui::Color32::from_rgb(100, 180, 255),
+            egui::Color32::from_rgba_premultiplied(30, 60, 100, 40),
+        ),
+        AgentChatRole::Assistant => (
+            "AI",
+            egui::Color32::from_rgb(130, 220, 130),
+            egui::Color32::from_rgba_premultiplied(30, 80, 40, 40),
+        ),
+        AgentChatRole::ToolCall => (
+            "⚙",
+            egui::Color32::from_rgb(200, 180, 100),
+            egui::Color32::from_rgba_premultiplied(60, 50, 20, 40),
+        ),
+        AgentChatRole::Error => (
+            "✗",
+            egui::Color32::from_rgb(255, 100, 100),
+            egui::Color32::from_rgba_premultiplied(80, 20, 20, 40),
+        ),
+    };
+
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::same(6))
+        .outer_margin(egui::Margin::symmetric(0, 2))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new(prefix).size(10.0).strong().color(color));
+            ui.label(egui::RichText::new(&msg.content).size(12.0));
         });
 }

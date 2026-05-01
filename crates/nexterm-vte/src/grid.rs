@@ -954,6 +954,21 @@ impl Grid {
         self.scrollback.len() + self.cells.len()
     }
 
+    /// Extract the last `n` non-empty lines from the terminal buffer as a single string.
+    pub fn extract_visible_text_last_n_lines(&self, n: usize) -> String {
+        let total = self.total_rows();
+        let start = total.saturating_sub(n);
+        let mut lines = Vec::with_capacity(n);
+        for abs in start..total {
+            if let Some(text) = self.row_text_at(abs) {
+                if !text.is_empty() {
+                    lines.push(text);
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
     /// Map a visual row (0 = top of viewport) to the corresponding absolute
     /// row, accounting for fold compression. Walks forward from the adjusted
     /// viewport start, skipping folded ranges exactly as the renderer does.
