@@ -36,8 +36,14 @@ pub enum TransferDirection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransferState {
     Queued,
-    InProgress { bytes_transferred: u64, total_bytes: u64 },
-    Paused { bytes_transferred: u64, total_bytes: u64 },
+    InProgress {
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
+    Paused {
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
     Completed,
     Failed(String),
 }

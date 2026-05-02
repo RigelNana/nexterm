@@ -8,9 +8,18 @@ use uuid::Uuid;
 /// Event emitted during a transfer for progress tracking.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
-    Progress { job_id: Uuid, bytes_transferred: u64, total_bytes: u64 },
-    Completed { job_id: Uuid },
-    Failed { job_id: Uuid, error: String },
+    Progress {
+        job_id: Uuid,
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
+    Completed {
+        job_id: Uuid,
+    },
+    Failed {
+        job_id: Uuid,
+        error: String,
+    },
 }
 
 /// Manages a queue of file transfers.
@@ -33,7 +42,12 @@ impl TransferManager {
     }
 
     /// Enqueue a new transfer job.
-    pub fn enqueue(&mut self, direction: TransferDirection, local_path: String, remote_path: String) -> Uuid {
+    pub fn enqueue(
+        &mut self,
+        direction: TransferDirection,
+        local_path: String,
+        remote_path: String,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         self.queue.push(TransferJob {
             id,

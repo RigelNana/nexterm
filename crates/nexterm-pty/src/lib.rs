@@ -101,11 +101,7 @@ impl LocalPty {
 
         let shell = resolve_shell(config.shell.as_deref());
         let kind = ShellKind::detect(&shell);
-        let mut cmd = build_command_with_integration(
-            &shell,
-            kind,
-            !config.no_shell_integration,
-        );
+        let mut cmd = build_command_with_integration(&shell, kind, !config.no_shell_integration);
 
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
@@ -158,7 +154,9 @@ fn build_command_with_integration(shell: &str, kind: ShellKind, inject: bool) ->
         ShellKind::Pwsh => {
             // Minimal integration: only wraps prompt with 133;A and 133;B.
             // No PSConsoleHostReadLine wrapping to avoid double-prompt issues.
-            if let Some(path) = write_integration_file("nexterm_integration.ps1", SHELL_INTEGRATION_PWSH) {
+            if let Some(path) =
+                write_integration_file("nexterm_integration.ps1", SHELL_INTEGRATION_PWSH)
+            {
                 let script = path.to_string_lossy().to_string();
                 let mut cmd = CommandBuilder::new(shell);
                 cmd.arg("-NoLogo");
@@ -172,7 +170,9 @@ fn build_command_with_integration(shell: &str, kind: ShellKind, inject: bool) ->
         }
         ShellKind::Bash => {
             // Bash: create a wrapper rcfile that sources user's bashrc then ours.
-            if let Some(int_path) = write_integration_file("nexterm_integration.bash", SHELL_INTEGRATION_BASH) {
+            if let Some(int_path) =
+                write_integration_file("nexterm_integration.bash", SHELL_INTEGRATION_BASH)
+            {
                 let wrapper = format!(
                     "[ -f ~/.bashrc ] && source ~/.bashrc\nsource '{}'\n",
                     int_path.to_string_lossy(),
@@ -191,8 +191,12 @@ fn build_command_with_integration(shell: &str, kind: ShellKind, inject: bool) ->
         }
         ShellKind::Zsh => {
             // Zsh: create a temp ZDOTDIR with .zshrc that sources user's + ours.
-            if let Some(int_path) = write_integration_file("nexterm_integration.zsh", SHELL_INTEGRATION_ZSH) {
-                let zdotdir = std::env::temp_dir().join("nexterm-shell-integration").join("zdotdir");
+            if let Some(int_path) =
+                write_integration_file("nexterm_integration.zsh", SHELL_INTEGRATION_ZSH)
+            {
+                let zdotdir = std::env::temp_dir()
+                    .join("nexterm-shell-integration")
+                    .join("zdotdir");
                 let _ = std::fs::create_dir_all(&zdotdir);
                 let user_zdotdir = std::env::var("ZDOTDIR")
                     .or_else(|_| std::env::var("HOME"))
@@ -214,7 +218,9 @@ fn build_command_with_integration(shell: &str, kind: ShellKind, inject: bool) ->
         }
         ShellKind::Fish => {
             // Fish: use --init-command to source our integration.
-            if let Some(int_path) = write_integration_file("nexterm_integration.fish", SHELL_INTEGRATION_FISH) {
+            if let Some(int_path) =
+                write_integration_file("nexterm_integration.fish", SHELL_INTEGRATION_FISH)
+            {
                 let mut cmd = CommandBuilder::new(shell);
                 cmd.arg("--init-command");
                 cmd.arg(format!("source '{}'", int_path.to_string_lossy()));
@@ -235,9 +241,13 @@ fn resolve_shell(requested: Option<&str>) -> String {
     match requested {
         Some("wsl") => {
             #[cfg(windows)]
-            { "wsl.exe".to_string() }
+            {
+                "wsl.exe".to_string()
+            }
             #[cfg(not(windows))]
-            { "/bin/bash".to_string() }
+            {
+                "/bin/bash".to_string()
+            }
         }
         Some(s) if !s.is_empty() && s != "auto" => s.to_string(),
         _ => auto_detect_shell(),

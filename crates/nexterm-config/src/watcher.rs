@@ -22,9 +22,7 @@ pub fn watch_config(path: &Path) -> Result<mpsc::Receiver<()>> {
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
 
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_os_string());
+    let file_name = path.file_name().map(|n| n.to_os_string());
 
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<Event>| {
@@ -32,9 +30,10 @@ pub fn watch_config(path: &Path) -> Result<mpsc::Receiver<()>> {
                 if event.kind.is_modify() || event.kind.is_create() {
                     // Only trigger for our config file
                     let matches = file_name.as_ref().map_or(true, |name| {
-                        event.paths.iter().any(|p| {
-                            p.file_name().map_or(false, |n| n == name.as_os_str())
-                        })
+                        event
+                            .paths
+                            .iter()
+                            .any(|p| p.file_name().map_or(false, |n| n == name.as_os_str()))
                     });
                     if matches {
                         info!(file = ?config_file, "config file changed, triggering reload");

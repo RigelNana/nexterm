@@ -31,11 +31,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: nexterm
-            archive: nexterm-macos-aarch64.tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: nexterm
-            archive: nexterm-macos-x86_64.tar.gz
+            archive: nexterm-macos-aarch64.dmg
 
     steps:
       - uses: actions/checkout@v4
@@ -79,13 +75,78 @@ jobs:
           $bin = "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           Compress-Archive -Path $bin -DestinationPath ${{ matrix.archive }}
 
-      # Unix: tar.gz
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      # Linux: plain tar.gz with the binary.
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         run: |
           tar czf ${{ matrix.archive }} \
             -C target/${{ matrix.target }}/release \
             ${{ matrix.artifact }}
+
+      # macOS: build a proper .app bundle (Info.plist + .icns from
+      # assets/icon.png) and hand it to `hdiutil` as a read-only,
+      # zlib-compressed UDZO DMG.  The staging folder also contains a
+      # symlink to /Applications so the mounted image shows the
+      # classic "drag NexTerm into Applications" affordance.  No
+      # code-signing: open-source builds ship unsigned and the user
+      # can right-click → Open on first launch to bypass Gatekeeper.
+      - name: Package (macOS DMG)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          APP="NexTerm.app"
+          BIN="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+
+          # --- .app bundle skeleton -------------------------------------------------
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/nexterm"
+          chmod +x "$APP/Contents/MacOS/nexterm"
+
+          # --- icon: assets/icon.png -> icon.icns via sips + iconutil --------------
+          mkdir -p icon.iconset
+          for SIZE in 16 32 128 256 512; do
+            sips -z $SIZE $SIZE assets/icon.png \
+              --out "icon.iconset/icon_${SIZE}x${SIZE}.png" > /dev/null
+            DOUBLE=$((SIZE * 2))
+            sips -z $DOUBLE $DOUBLE assets/icon.png \
+              --out "icon.iconset/icon_${SIZE}x${SIZE}@2x.png" > /dev/null
+          done
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+
+          # --- Info.plist (minimal but complete) ------------------------------------
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>NexTerm</string>
+            <key>CFBundleDisplayName</key><string>NexTerm</string>
+            <key>CFBundleIdentifier</key><string>dev.nexterm.app</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleExecutable</key><string>nexterm</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSPrincipalClass</key><string>NSApplication</string>
+          </dict>
+          </plist>
+          PLIST
+
+          # --- staging dir with /Applications symlink for drag-to-install ----------
+          STAGING="dmg-staging"
+          mkdir -p "$STAGING"
+          cp -R "$APP" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+
+          # --- hdiutil: zlib-compressed read-only DMG ------------------------------
+          hdiutil create \
+            -volname "NexTerm" \
+            -srcfolder "$STAGING" \
+            -ov -format UDZO \
+            "${{ matrix.archive }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -118,8 +179,7 @@ jobs:
           echo "|----------|-------------|------|" >> RELEASE_NOTES.md
           echo "| Windows  | x86_64      | \`nexterm-windows-x86_64.zip\` |" >> RELEASE_NOTES.md
           echo "| Linux    | x86_64      | \`nexterm-linux-x86_64.tar.gz\` |" >> RELEASE_NOTES.md
-          echo "| macOS    | Apple Silicon (aarch64) | \`nexterm-macos-aarch64.tar.gz\` |" >> RELEASE_NOTES.md
-          echo "| macOS    | Intel (x86_64) | \`nexterm-macos-x86_64.tar.gz\` |" >> RELEASE_NOTES.md
+          echo "| macOS    | Apple Silicon (aarch64) | \`nexterm-macos-aarch64.dmg\` |" >> RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

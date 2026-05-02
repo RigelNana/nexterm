@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use nexterm_ssh::{AuthMethod, SshProfile};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tracing::info;
 use uuid::Uuid;
 
@@ -59,11 +59,14 @@ impl SessionStore {
     /// SQLite doesn't support ALTER TABLE DROP CONSTRAINT, so we recreate the table.
     fn migrate_remove_fk(&self) -> Result<()> {
         // Check if the existing table has FK constraints by inspecting the schema SQL
-        let sql: Option<String> = self.conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ssh_profiles'",
-            [],
-            |row| row.get(0),
-        ).ok();
+        let sql: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='ssh_profiles'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
         if let Some(sql) = sql {
             if sql.contains("FOREIGN KEY") {
                 info!("migrating ssh_profiles: removing FK constraints");
@@ -145,26 +148,59 @@ impl SessionStore {
             let tags_json: String = row.get(9)?;
             let group_str: String = row.get(10)?;
 
-            Ok((id_str, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, u16>(3)?, row.get::<_, String>(4)?,
-                auth_json, proxy_json, env_json,
-                row.get::<_, u32>(8)?, tags_json, group_str))
+            Ok((
+                id_str,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u16>(3)?,
+                row.get::<_, String>(4)?,
+                auth_json,
+                proxy_json,
+                env_json,
+                row.get::<_, u32>(8)?,
+                tags_json,
+                group_str,
+            ))
         })?;
 
         let mut result = Vec::new();
         for row in profiles {
-            let (id_str, name, host, port, username, auth_json, proxy_json, env_json, keepalive, tags_json, group_str) = row?;
+            let (
+                id_str,
+                name,
+                host,
+                port,
+                username,
+                auth_json,
+                proxy_json,
+                env_json,
+                keepalive,
+                tags_json,
+                group_str,
+            ) = row?;
             let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
             let auth: AuthMethod = serde_json::from_str(&auth_json).unwrap_or(AuthMethod::Agent);
             let proxy_jump: Vec<String> = serde_json::from_str(&proxy_json).unwrap_or_default();
             let env: Vec<(String, String)> = serde_json::from_str(&env_json).unwrap_or_default();
             let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-            let group = if group_str.is_empty() { None } else { Some(group_str) };
+            let group = if group_str.is_empty() {
+                None
+            } else {
+                Some(group_str)
+            };
 
             result.push(SshProfile {
-                id, name, host, port, username, auth,
-                proxy_jump, env, keepalive_interval: keepalive,
-                tags, group,
+                id,
+                name,
+                host,
+                port,
+                username,
+                auth,
+                proxy_jump,
+                env,
+                keepalive_interval: keepalive,
+                tags,
+                group,
             });
         }
         info!(count = result.len(), "profiles loaded from store");
@@ -183,9 +219,9 @@ impl SessionStore {
 
     /// Count the stored profiles.
     pub fn profile_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM ssh_profiles", [], |row| row.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM ssh_profiles", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 }

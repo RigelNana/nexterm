@@ -11,14 +11,17 @@ wgpu.workspace = true
 winit.workspace = true
 raw-window-handle.workspace = true
 cosmic-text.workspace = true
+swash = "0.1"
 bytemuck = { version = "1", features = ["derive"] }
 anyhow.workspace = true
 tracing.workspace = true
 nexterm-vte.workspace = true
 nexterm-theme.workspace = true
+nexterm-docker.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
+egui_commonmark.workspace = true
 image.workspace = true
 jiff.workspace = true
 rfd = "0.15"

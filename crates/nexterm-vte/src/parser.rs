@@ -3,10 +3,10 @@
 //! Splits into `TermState` (implements `vte::Perform`) and `TerminalParser` (owns the VTE
 //! state machine + TermState) so the borrow checker is happy.
 
-use vte::{Params, Perform};
+use crate::grid::{Cell, CellAttrs, Color, Grid, SavedCursor};
 use tracing::trace;
 use unicode_width::UnicodeWidthChar;
-use crate::grid::{Grid, Cell, Color, CellAttrs, SavedCursor};
+use vte::{Params, Perform};
 
 /// Terminal state that receives VTE actions and updates the grid.
 pub struct TermState {
@@ -111,6 +111,7 @@ impl TermState {
                     attrs,
                 };
             }
+            self.grid.damage_line(row, col, col + batch - 1);
             bi += batch;
             let new_col = col + batch;
             if new_col < self.grid.cols {
@@ -184,7 +185,25 @@ impl TerminalParser {
 impl Perform for TermState {
     fn print(&mut self, c: char) {
         self.in_ground = true;
-        let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
+        let char_width = match UnicodeWidthChar::width(c) {
+            Some(width) => width,
+            None => return,
+        };
+
+        if char_width == 0 {
+            let row = self.grid.cursor_row;
+            let mut col = self.grid.cursor_col;
+            if !self.pending_wrap {
+                col = col.saturating_sub(1);
+            }
+            if row < self.grid.rows && col < self.grid.cols {
+                if self.grid.cells[row][col].attrs.contains(CellAttrs::WIDE_TAIL) {
+                    col = col.saturating_sub(1);
+                }
+                self.grid.damage_line(row, col, col);
+            }
+            return;
+        }
 
         // If pending wrap from previous char at end of line, wrap now
         if self.pending_wrap && self.grid.auto_wrap {
@@ -216,14 +235,18 @@ impl Perform for TermState {
                 bg: self.current_bg,
                 attrs: self.current_attrs | CellAttrs::WIDE,
             };
-            if col + 1 < self.grid.cols {
+            let tail_col = if col + 1 < self.grid.cols {
                 self.grid.cells[row][col + 1] = Cell {
                     ch: ' ',
                     fg: self.current_fg,
                     bg: self.current_bg,
                     attrs: self.current_attrs | CellAttrs::WIDE_TAIL,
                 };
-            }
+                col + 1
+            } else {
+                col
+            };
+            self.grid.damage_line(row, col, tail_col);
             self.grid.cursor_col += 2;
             if self.grid.cursor_col >= self.grid.cols {
                 self.pending_wrap = true;
@@ -237,6 +260,7 @@ impl Perform for TermState {
                 bg: self.current_bg,
                 attrs: self.current_attrs,
             };
+            self.grid.damage_line(row, col, col);
             if col + 1 < self.grid.cols {
                 self.grid.cursor_col += 1;
             } else {
@@ -247,14 +271,22 @@ impl Perform for TermState {
     }
 
     fn execute(&mut self, byte: u8) {
+        let old_row = self.grid.cursor_row;
+        let old_col = self.grid.cursor_col;
         match byte {
             0x07 => {} // BEL — ignore
-            0x08 => {  // BS (Backspace)
+            0x08 => {
+                // BS (Backspace)
                 if self.grid.cursor_col > 0 {
                     self.grid.cursor_col -= 1;
                 } else if self.grid.auto_wrap
                     && self.grid.cursor_row > 0
-                    && self.grid.line_wrapped.get(self.grid.cursor_row).copied().unwrap_or(false)
+                    && self
+                        .grid
+                        .line_wrapped
+                        .get(self.grid.cursor_row)
+                        .copied()
+                        .unwrap_or(false)
                 {
                     // Reverse wrap: BS at col 0 of a soft-wrap continuation row
                     // moves to the end of the previous row, keeping shell/terminal
@@ -264,16 +296,19 @@ impl Perform for TermState {
                 }
                 self.pending_wrap = false;
             }
-            0x09 => {  // HT (tab)
+            0x09 => {
+                // HT (tab)
                 let next = ((self.grid.cursor_col / 8) + 1) * 8;
                 self.grid.cursor_col = next.min(self.grid.cols - 1);
                 self.pending_wrap = false;
             }
-            0x0A | 0x0B | 0x0C => { // LF / VT / FF
+            0x0A | 0x0B | 0x0C => {
+                // LF / VT / FF
                 self.linefeed();
                 self.pending_wrap = false;
             }
-            0x0D => { // CR
+            0x0D => {
+                // CR
                 self.grid.cursor_col = 0;
                 self.pending_wrap = false;
             }
@@ -282,6 +317,18 @@ impl Perform for TermState {
             _ => {
                 trace!("unhandled execute byte: 0x{byte:02X}");
             }
+        }
+        // Repaint the old and new cursor cells whenever the cursor moves so the
+        // cursor block follows the caret without a grid-wide redraw.
+        if old_row != self.grid.cursor_row {
+            self.grid.damage_row(old_row);
+            self.grid.damage_row(self.grid.cursor_row);
+        } else if old_col != self.grid.cursor_col {
+            self.grid.damage_line(
+                old_row,
+                old_col.min(self.grid.cursor_col),
+                old_col.max(self.grid.cursor_col),
+            );
         }
     }
 
@@ -301,54 +348,70 @@ impl Perform for TermState {
 
         self.pending_wrap = false;
 
+        let old_row = self.grid.cursor_row;
+        let old_col = self.grid.cursor_col;
+
         match (action, private) {
             // ---- Cursor movement ----
-            ('A', false) => { // CUU - Cursor Up
+            ('A', false) => {
+                // CUU - Cursor Up
                 self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n());
             }
-            ('B', false) => { // CUD - Cursor Down
+            ('B', false) => {
+                // CUD - Cursor Down
                 self.grid.cursor_row = (self.grid.cursor_row + n()).min(self.grid.rows - 1);
             }
-            ('C', false) => { // CUF - Cursor Forward
+            ('C', false) => {
+                // CUF - Cursor Forward
                 self.grid.cursor_col = (self.grid.cursor_col + n()).min(self.grid.cols - 1);
             }
-            ('D', false) => { // CUB - Cursor Back
+            ('D', false) => {
+                // CUB - Cursor Back
                 self.grid.cursor_col = self.grid.cursor_col.saturating_sub(n());
             }
-            ('E', false) => { // CNL - Cursor Next Line
+            ('E', false) => {
+                // CNL - Cursor Next Line
                 self.grid.cursor_row = (self.grid.cursor_row + n()).min(self.grid.rows - 1);
                 self.grid.cursor_col = 0;
             }
-            ('F', false) => { // CPL - Cursor Previous Line
+            ('F', false) => {
+                // CPL - Cursor Previous Line
                 self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n());
                 self.grid.cursor_col = 0;
             }
-            ('G', false) => { // CHA - Cursor Character Absolute
+            ('G', false) => {
+                // CHA - Cursor Character Absolute
                 let col = n().saturating_sub(1);
                 self.grid.cursor_col = col.min(self.grid.cols - 1);
             }
-            ('H' | 'f', false) => { // CUP - Cursor Position
+            ('H' | 'f', false) => {
+                // CUP - Cursor Position
                 let row = p.first().copied().unwrap_or(1).max(1) as usize - 1;
                 let col = p.get(1).copied().unwrap_or(1).max(1) as usize - 1;
                 if self.grid.origin_mode {
-                    self.grid.cursor_row = (self.grid.scroll_top + row).min(self.grid.scroll_bottom);
+                    self.grid.cursor_row =
+                        (self.grid.scroll_top + row).min(self.grid.scroll_bottom);
                 } else {
                     self.grid.cursor_row = row.min(self.grid.rows - 1);
                 }
                 self.grid.cursor_col = col.min(self.grid.cols - 1);
             }
-            ('d', false) => { // VPA - Line Position Absolute
+            ('d', false) => {
+                // VPA - Line Position Absolute
                 let row = n().saturating_sub(1);
                 if self.grid.origin_mode {
-                    self.grid.cursor_row = (self.grid.scroll_top + row).min(self.grid.scroll_bottom);
+                    self.grid.cursor_row =
+                        (self.grid.scroll_top + row).min(self.grid.scroll_bottom);
                 } else {
                     self.grid.cursor_row = row.min(self.grid.rows - 1);
                 }
             }
-            ('e', false) => { // VPR - Line Position Relative
+            ('e', false) => {
+                // VPR - Line Position Relative
                 self.grid.cursor_row = (self.grid.cursor_row + n()).min(self.grid.rows - 1);
             }
-            ('`', false) => { // HPA - Character Position Absolute (same as CHA)
+            ('`', false) => {
+                // HPA - Character Position Absolute (same as CHA)
                 let col = n().saturating_sub(1);
                 self.grid.cursor_col = col.min(self.grid.cols - 1);
             }
@@ -358,22 +421,34 @@ impl Perform for TermState {
                 let mode = p.first().copied().unwrap_or(0);
                 let blank = self.erase_cell();
                 match mode {
-                    0 => { // Erase Below
+                    0 => {
+                        // Erase Below
                         self.grid.cells[self.grid.cursor_row][self.grid.cursor_col..].fill(blank);
+                        self.grid.damage_line(
+                            self.grid.cursor_row,
+                            self.grid.cursor_col,
+                            self.grid.cols - 1,
+                        );
                         for r in (self.grid.cursor_row + 1)..self.grid.rows {
                             self.grid.cells[r].fill(blank);
                             self.grid.reset_row_timestamp(r);
+                            self.grid.damage_row(r);
                         }
                     }
-                    1 => { // Erase Above
+                    1 => {
+                        // Erase Above
                         for r in 0..self.grid.cursor_row {
                             self.grid.cells[r].fill(blank);
                             self.grid.reset_row_timestamp(r);
+                            self.grid.damage_row(r);
                         }
                         let end = self.grid.cursor_col.min(self.grid.cols - 1) + 1;
                         self.grid.cells[self.grid.cursor_row][..end].fill(blank);
+                        self.grid
+                            .damage_line(self.grid.cursor_row, 0, end.saturating_sub(1));
                     }
-                    2 | 3 => { // Erase All
+                    2 | 3 => {
+                        // Erase All
                         for r in 0..self.grid.rows {
                             self.grid.cells[r].fill(blank);
                             self.grid.reset_row_timestamp(r);
@@ -388,6 +463,7 @@ impl Perform for TermState {
                             let ts = Grid::now_timestamp();
                             self.grid.block_list.reset(abs, ts);
                         }
+                        self.grid.damage_full();
                     }
                     _ => {}
                 }
@@ -396,10 +472,21 @@ impl Perform for TermState {
                 let mode = p.first().copied().unwrap_or(0);
                 let blank = self.erase_cell();
                 let row = self.grid.cursor_row;
+                let last = self.grid.cols.saturating_sub(1);
                 match mode {
-                    0 => { self.grid.cells[row][self.grid.cursor_col..].fill(blank); }
-                    1 => { let end = self.grid.cursor_col.min(self.grid.cols - 1) + 1; self.grid.cells[row][..end].fill(blank); }
-                    2 => { self.grid.cells[row].fill(blank); }
+                    0 => {
+                        self.grid.cells[row][self.grid.cursor_col..].fill(blank);
+                        self.grid.damage_line(row, self.grid.cursor_col, last);
+                    }
+                    1 => {
+                        let end = self.grid.cursor_col.min(last) + 1;
+                        self.grid.cells[row][..end].fill(blank);
+                        self.grid.damage_line(row, 0, end.saturating_sub(1));
+                    }
+                    2 => {
+                        self.grid.cells[row].fill(blank);
+                        self.grid.damage_row(row);
+                    }
                     _ => {}
                 }
             }
@@ -476,7 +563,8 @@ impl Perform for TermState {
             }
 
             // ---- Insert/Delete Lines (respect scroll region) ----
-            ('L', false) => { // IL - Insert Lines
+            ('L', false) => {
+                // IL - Insert Lines
                 let cur = self.grid.cursor_row;
                 let bot = self.grid.scroll_bottom.min(self.grid.rows - 1);
                 if cur <= bot {
@@ -490,9 +578,14 @@ impl Perform for TermState {
                         self.grid.cells[r].fill(Cell::default());
                         self.grid.reset_row_timestamp(r);
                     }
+                    // Entire scroll region below cur got shifted — mark all dirty.
+                    for r in cur..=bot {
+                        self.grid.damage_row(r);
+                    }
                 }
             }
-            ('M', false) => { // DL - Delete Lines
+            ('M', false) => {
+                // DL - Delete Lines
                 let cur = self.grid.cursor_row;
                 let bot = self.grid.scroll_bottom.min(self.grid.rows - 1);
                 if cur <= bot {
@@ -506,19 +599,25 @@ impl Perform for TermState {
                         self.grid.cells[r].fill(Cell::default());
                         self.grid.reset_row_timestamp(r);
                     }
+                    for r in cur..=bot {
+                        self.grid.damage_row(r);
+                    }
                 }
             }
 
             // ---- Scroll Up/Down ----
-            ('S', false) => { // SU - Scroll Up
+            ('S', false) => {
+                // SU - Scroll Up
                 self.grid.scroll_up_n_in_region(n());
             }
-            ('T', false) => { // SD - Scroll Down
+            ('T', false) => {
+                // SD - Scroll Down
                 self.grid.scroll_down_n_in_region(n());
             }
 
             // ---- Insert/Delete Characters ----
-            ('@', false) => { // ICH
+            ('@', false) => {
+                // ICH
                 let row = self.grid.cursor_row;
                 let col = self.grid.cursor_col;
                 let cols = self.grid.cols;
@@ -526,8 +625,10 @@ impl Perform for TermState {
                 // Shift cells right by count, dropping the rightmost ones
                 self.grid.cells[row].copy_within(col..cols - count, col + count);
                 self.grid.cells[row][col..col + count].fill(Cell::default());
+                self.grid.damage_line(row, col, cols.saturating_sub(1));
             }
-            ('P', false) => { // DCH
+            ('P', false) => {
+                // DCH
                 let row = self.grid.cursor_row;
                 let col = self.grid.cursor_col;
                 let cols = self.grid.cols;
@@ -535,13 +636,18 @@ impl Perform for TermState {
                 // Shift cells left by count, filling the rightmost with blanks
                 self.grid.cells[row].copy_within(col + count..cols, col);
                 self.grid.cells[row][cols - count..].fill(Cell::default());
+                self.grid.damage_line(row, col, cols.saturating_sub(1));
             }
-            ('X', false) => { // ECH
+            ('X', false) => {
+                // ECH
                 let count = n().min(self.grid.cols - self.grid.cursor_col);
                 let row = self.grid.cursor_row;
                 let blank = self.erase_cell();
                 let col = self.grid.cursor_col;
                 self.grid.cells[row][col..col + count].fill(blank);
+                if count > 0 {
+                    self.grid.damage_line(row, col, col + count - 1);
+                }
             }
 
             // ---- DECSTBM: Set Scrolling Region ----
@@ -563,7 +669,8 @@ impl Perform for TermState {
             }
 
             // ---- Cursor Save/Restore (ANSI) ----
-            ('s', false) => { // SCP - Save Cursor Position
+            ('s', false) => {
+                // SCP - Save Cursor Position
                 self.grid.saved_cursor = Some(SavedCursor {
                     row: self.grid.cursor_row,
                     col: self.grid.cursor_col,
@@ -572,7 +679,8 @@ impl Perform for TermState {
                     attrs: self.current_attrs,
                 });
             }
-            ('u', false) => { // RCP - Restore Cursor Position
+            ('u', false) => {
+                // RCP - Restore Cursor Position
                 if let Some(saved) = self.grid.saved_cursor.clone() {
                     self.grid.cursor_row = saved.row.min(self.grid.rows - 1);
                     self.grid.cursor_col = saved.col.min(self.grid.cols - 1);
@@ -633,26 +741,28 @@ impl Perform for TermState {
             ('h', true) => {
                 for &mode in p {
                     match mode {
-                        1 => self.grid.application_cursor_keys = true,   // DECCKM
-                        6 => { // DECOM - Origin Mode
+                        1 => self.grid.application_cursor_keys = true, // DECCKM
+                        6 => {
+                            // DECOM - Origin Mode
                             self.grid.origin_mode = true;
                             self.grid.cursor_row = self.grid.scroll_top;
                             self.grid.cursor_col = 0;
                         }
-                        7 => self.grid.auto_wrap = true,                  // DECAWM
-                        12 => {} // Cursor blink on — handled by renderer
-                        25 => self.grid.cursor_visible = true,            // DECTCEM
-                        47 => self.grid.enter_alt_screen(),               // Alt screen (old)
-                        66 => self.grid.application_keypad = true,        // DECNKM
-                        1000 => self.grid.mouse_tracking = 1000,          // Normal mouse tracking
-                        1002 => self.grid.mouse_tracking = 1002,          // Button-event tracking
-                        1003 => self.grid.mouse_tracking = 1003,          // Any-event tracking
-                        1004 => {} // Focus events — ignore
-                        1005 => {} // UTF-8 mouse — ignore
-                        1006 => self.grid.mouse_format = 1006,            // SGR mouse format
-                        1015 => {} // URXVT mouse — ignore
-                        1047 => self.grid.enter_alt_screen(),             // Alt screen
-                        1048 => { // Save cursor
+                        7 => self.grid.auto_wrap = true, // DECAWM
+                        12 => {}                         // Cursor blink on — handled by renderer
+                        25 => self.grid.cursor_visible = true, // DECTCEM
+                        47 => self.grid.enter_alt_screen(), // Alt screen (old)
+                        66 => self.grid.application_keypad = true, // DECNKM
+                        1000 => self.grid.mouse_tracking = 1000, // Normal mouse tracking
+                        1002 => self.grid.mouse_tracking = 1002, // Button-event tracking
+                        1003 => self.grid.mouse_tracking = 1003, // Any-event tracking
+                        1004 => {}                       // Focus events — ignore
+                        1005 => {}                       // UTF-8 mouse — ignore
+                        1006 => self.grid.mouse_format = 1006, // SGR mouse format
+                        1015 => {}                       // URXVT mouse — ignore
+                        1047 => self.grid.enter_alt_screen(), // Alt screen
+                        1048 => {
+                            // Save cursor
                             self.grid.saved_cursor = Some(SavedCursor {
                                 row: self.grid.cursor_row,
                                 col: self.grid.cursor_col,
@@ -661,7 +771,8 @@ impl Perform for TermState {
                                 attrs: self.current_attrs,
                             });
                         }
-                        1049 => { // Alt screen + save cursor
+                        1049 => {
+                            // Alt screen + save cursor
                             self.grid.saved_cursor = Some(SavedCursor {
                                 row: self.grid.cursor_row,
                                 col: self.grid.cursor_col,
@@ -695,7 +806,8 @@ impl Perform for TermState {
                         1004 => {}
                         1005 | 1006 | 1015 => self.grid.mouse_format = 0,
                         1047 => self.grid.leave_alt_screen(),
-                        1048 => { // Restore cursor
+                        1048 => {
+                            // Restore cursor
                             if let Some(saved) = self.grid.saved_cursor.clone() {
                                 self.grid.cursor_row = saved.row.min(self.grid.rows - 1);
                                 self.grid.cursor_col = saved.col.min(self.grid.cols - 1);
@@ -704,7 +816,8 @@ impl Perform for TermState {
                                 self.current_attrs = saved.attrs;
                             }
                         }
-                        1049 => { // Leave alt screen + restore cursor
+                        1049 => {
+                            // Leave alt screen + restore cursor
                             self.grid.leave_alt_screen();
                             if let Some(saved) = self.grid.saved_cursor.clone() {
                                 self.grid.cursor_row = saved.row.min(self.grid.rows - 1);
@@ -729,8 +842,21 @@ impl Perform for TermState {
             }
 
             _ => {
-                trace!("unhandled CSI: params={p:?} intermediates={intermediates:?} action={action}");
+                trace!(
+                    "unhandled CSI: params={p:?} intermediates={intermediates:?} action={action}"
+                );
             }
+        }
+        // Repaint old + new cursor cells when a CSI moved the caret.
+        if old_row != self.grid.cursor_row {
+            self.grid.damage_row(old_row);
+            self.grid.damage_row(self.grid.cursor_row);
+        } else if old_col != self.grid.cursor_col {
+            self.grid.damage_line(
+                old_row,
+                old_col.min(self.grid.cursor_col),
+                old_col.max(self.grid.cursor_col),
+            );
         }
     }
 
@@ -771,11 +897,14 @@ impl Perform for TermState {
                             // VTE splits semicolons: \e]133;D;0\a → params["133","D","0"]
                             // so the exit code is typically in params[2].
                             // Fallback: also try "D;0" format in kind itself.
-                            let exit_code = params.get(2)
+                            let exit_code = params
+                                .get(2)
                                 .and_then(|b| std::str::from_utf8(b).ok())
                                 .and_then(|s| s.parse::<i32>().ok())
-                                .or_else(|| kind.get(2..)
-                                    .and_then(|s| s.trim_start_matches(';').parse::<i32>().ok()));
+                                .or_else(|| {
+                                    kind.get(2..)
+                                        .and_then(|s| s.trim_start_matches(';').parse::<i32>().ok())
+                                });
                             self.grid.mark_block_completed(exit_code);
                         }
                         _ => {}
@@ -789,6 +918,8 @@ impl Perform for TermState {
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         self.in_ground = true;
         self.pending_wrap = false;
+        let old_row = self.grid.cursor_row;
+        let old_col = self.grid.cursor_col;
         match (byte, intermediates.first()) {
             // RI - Reverse Index (move cursor up, scroll down if at top margin)
             (b'M', None) => {
@@ -832,6 +963,7 @@ impl Perform for TermState {
                 self.current_fg = Color::Default;
                 self.current_bg = Color::Default;
                 self.current_attrs = CellAttrs::empty();
+                self.grid.damage_full();
             }
             // DECKPAM - Application Keypad
             (b'=', None) => {
@@ -848,6 +980,16 @@ impl Perform for TermState {
                 trace!("unhandled ESC: byte=0x{byte:02X} intermediates={intermediates:?}");
             }
         }
+        if old_row != self.grid.cursor_row {
+            self.grid.damage_row(old_row);
+            self.grid.damage_row(self.grid.cursor_row);
+        } else if old_col != self.grid.cursor_col {
+            self.grid.damage_line(
+                old_row,
+                old_col.min(self.grid.cursor_col),
+                old_col.max(self.grid.cursor_col),
+            );
+        }
     }
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {
@@ -856,5 +998,94 @@ impl Perform for TermState {
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {
         self.in_ground = true;
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+
+    fn new_parser(cols: usize, rows: usize) -> TerminalParser {
+        let mut p = TerminalParser::new(cols, rows);
+        // Initial grid is fully damaged; reset so we can observe the effect of
+        // each sequence in isolation.
+        p.grid_mut().clear_damage();
+        p
+    }
+
+    #[test]
+    fn print_ascii_damages_only_cursor_row() {
+        let mut p = new_parser(20, 5);
+        p.process(b"hi");
+        assert!(p.grid().is_damaged());
+        assert!(!p.grid().damage.full);
+        // Row 0 should have damage from col 0..1
+        assert!(p.grid().damage.lines[0].damaged);
+        assert_eq!(p.grid().damage.lines[0].left, 0);
+        assert_eq!(p.grid().damage.lines[0].right, 1);
+        // Other rows untouched
+        for r in 1..5 {
+            assert!(!p.grid().damage.lines[r].damaged);
+        }
+    }
+
+    #[test]
+    fn sgr_alone_does_not_damage() {
+        let mut p = new_parser(20, 5);
+        p.process(b"\x1b[31m"); // SGR red
+        assert!(!p.grid().is_damaged());
+    }
+
+    #[test]
+    fn erase_line_k0_damages_only_current_row() {
+        let mut p = new_parser(20, 5);
+        // Write a char so something is there
+        p.process(b"x");
+        p.grid_mut().clear_damage();
+        p.process(b"\x1b[K"); // Erase to end of line
+        assert!(p.grid().damage.lines[0].damaged);
+        for r in 1..5 {
+            assert!(!p.grid().damage.lines[r].damaged);
+        }
+    }
+
+    #[test]
+    fn erase_all_j2_marks_full_damage() {
+        let mut p = new_parser(20, 5);
+        p.process(b"\x1b[2J");
+        assert!(p.grid().damage.full);
+    }
+
+    #[test]
+    fn cursor_move_damages_old_and_new_rows() {
+        let mut p = new_parser(20, 5);
+        // Move cursor from (0,0) → (3, 5) via CUP
+        p.process(b"\x1b[4;6H");
+        // Old row 0 and new row 3 should both be damaged
+        assert!(p.grid().damage.lines[0].damaged);
+        assert!(p.grid().damage.lines[3].damaged);
+        assert!(!p.grid().damage.lines[1].damaged);
+        assert!(!p.grid().damage.lines[2].damaged);
+        assert!(!p.grid().damage.lines[4].damaged);
+    }
+
+    #[test]
+    fn print_then_clear_damage_yields_clean_grid() {
+        let mut p = new_parser(20, 5);
+        p.process(b"hello");
+        assert!(p.grid().is_damaged());
+        p.grid_mut().clear_damage();
+        assert!(!p.grid().is_damaged());
+    }
+
+    #[test]
+    fn scroll_at_bottom_marks_full_damage() {
+        let mut p = new_parser(20, 5);
+        // Move cursor to last row
+        p.process(b"\x1b[5;1H");
+        p.grid_mut().clear_damage();
+        // Linefeed at bottom → scroll
+        p.process(b"\n");
+        assert!(p.grid().damage.full);
     }
 }

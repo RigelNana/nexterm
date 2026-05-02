@@ -129,7 +129,10 @@ The tool returns the command's stdout/stderr output and exit code."#
             })?
             .to_string();
 
-        let pane_id = args.get("pane_id").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let pane_id = args
+            .get("pane_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         // Step 1: Send the command to the terminal
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -228,7 +231,10 @@ Parameters:
         args: serde_json::Value,
         _ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let pane_id = args.get("pane_id").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let pane_id = args
+            .get("pane_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         let last_n = args
             .get("last_n_blocks")
             .and_then(|v| v.as_u64())
@@ -316,9 +322,7 @@ This information comes from the system status probe and does not require running
 // ---------------------------------------------------------------------------
 
 /// Build the full set of NexTerm terminal tools.
-pub fn build_nexterm_tools(
-    request_tx: mpsc::Sender<ToolRequest>,
-) -> Vec<Arc<dyn ToolDefinition>> {
+pub fn build_nexterm_tools(request_tx: mpsc::Sender<ToolRequest>) -> Vec<Arc<dyn ToolDefinition>> {
     vec![
         Arc::new(ExecuteCommandTool {
             request_tx: request_tx.clone(),
@@ -326,8 +330,6 @@ pub fn build_nexterm_tools(
         Arc::new(ReadTerminalOutputTool {
             request_tx: request_tx.clone(),
         }),
-        Arc::new(ReadSystemStatusTool {
-            request_tx,
-        }),
+        Arc::new(ReadSystemStatusTool { request_tx }),
     ]
 }

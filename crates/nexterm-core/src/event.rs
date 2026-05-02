@@ -21,7 +21,10 @@ pub enum AppEvent {
     /// Request to split the current pane.
     SplitPane { direction: SplitDirection },
     /// SSH connection state changed.
-    SshStateChanged { session_id: Uuid, state: ConnectionState },
+    SshStateChanged {
+        session_id: Uuid,
+        state: ConnectionState,
+    },
     /// AI agent event (forwarded from Agenium).
     AgentEvent { pane_id: Uuid, payload: String },
     /// Configuration reloaded.

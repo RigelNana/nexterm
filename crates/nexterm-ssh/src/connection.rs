@@ -11,14 +11,22 @@ use uuid::Uuid;
 use crate::SshProfile;
 
 /// An active SSH connection handle.
+///
+/// The inner russh handle is wrapped in `Arc` so it can be cheaply shared
+/// with subsystems that need to open their own channels (Docker backend,
+/// port forwarding, etc.) without disturbing the interactive shell channel.
 pub struct SshConnection {
     pub id: Uuid,
     pub profile: SshProfile,
-    handle: Option<client::Handle<ClientHandler>>,
+    handle: Option<Arc<client::Handle<ClientHandler>>>,
 }
 
 /// russh client handler (callbacks).
-struct ClientHandler;
+///
+/// Made public so that other crates (notably `nexterm-docker`'s SSH backend)
+/// can name the concrete `russh::client::Handle<ClientHandler>` type when
+/// receiving a handle clone from the active SSH pane.
+pub struct ClientHandler;
 
 #[async_trait]
 impl client::Handler for ClientHandler {
@@ -55,7 +63,10 @@ impl SshConnection {
                     anyhow::bail!("password authentication failed");
                 }
             }
-            crate::AuthMethod::PublicKey { key_path, passphrase } => {
+            crate::AuthMethod::PublicKey {
+                key_path,
+                passphrase,
+            } => {
                 let key = russh_keys::load_secret_key(key_path, passphrase.as_deref())?;
                 let authenticated = handle
                     .authenticate_publickey(&profile.username, Arc::new(key))
@@ -80,15 +91,31 @@ impl SshConnection {
         Ok(Self {
             id: profile.id,
             profile,
-            handle: Some(handle),
+            handle: Some(Arc::new(handle)),
         })
     }
 
+    /// Clone the (Arc-wrapped) russh client handle so other subsystems can
+    /// open their own channels without interfering with the interactive
+    /// shell. Returns `None` if the connection has already been disconnected.
+    pub fn clone_handle(&self) -> Option<Arc<client::Handle<ClientHandler>>> {
+        self.handle.clone()
+    }
+
     /// Open an interactive PTY channel on the remote.
-    pub async fn open_shell(&mut self, cols: u32, rows: u32) -> Result<russh::Channel<client::Msg>> {
-        let handle = self.handle.as_ref().ok_or_else(|| anyhow::anyhow!("not connected"))?;
+    pub async fn open_shell(
+        &mut self,
+        cols: u32,
+        rows: u32,
+    ) -> Result<russh::Channel<client::Msg>> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
         let channel = handle.channel_open_session().await?;
-        channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await?;
+        channel
+            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+            .await?;
         channel.request_shell(false).await?;
         Ok(channel)
     }
@@ -116,7 +143,10 @@ impl SshConnection {
 
     /// Open an SFTP subsystem channel for file operations.
     pub async fn open_sftp(&self) -> Result<russh_sftp::client::SftpSession> {
-        let handle = self.handle.as_ref().ok_or_else(|| anyhow::anyhow!("not connected"))?;
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
         let channel = handle.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
         let sftp = russh_sftp::client::SftpSession::new(channel.into_stream()).await?;
@@ -126,7 +156,9 @@ impl SshConnection {
     /// Disconnect gracefully.
     pub async fn disconnect(&mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
-            handle.disconnect(Disconnect::ByApplication, "user requested", "en").await?;
+            handle
+                .disconnect(Disconnect::ByApplication, "user requested", "en")
+                .await?;
         }
         Ok(())
     }

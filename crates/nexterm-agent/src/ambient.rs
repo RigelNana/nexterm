@@ -42,11 +42,13 @@ impl AmbientAgent {
             if should_analyze {
                 tracing::debug!(pane_id = %input.pane_id, "ambient agent: error detected, queuing analysis");
                 // TODO: invoke Agenium agent with error context for diagnosis
-                let _ = suggestion_tx.send(AmbientSuggestion {
-                    pane_id: input.pane_id,
-                    message: format!("Error detected. Would you like AI to diagnose?"),
-                    auto_show: true,
-                }).await;
+                let _ = suggestion_tx
+                    .send(AmbientSuggestion {
+                        pane_id: input.pane_id,
+                        message: format!("Error detected. Would you like AI to diagnose?"),
+                        auto_show: true,
+                    })
+                    .await;
             }
         }
     }
@@ -55,9 +57,14 @@ impl AmbientAgent {
 /// Simple pattern matching for common error indicators.
 fn contains_error_pattern(text: &str) -> bool {
     let patterns = [
-        "error:", "Error:", "ERROR",
-        "fatal:", "Fatal:", "FATAL",
-        "panic:", "PANIC",
+        "error:",
+        "Error:",
+        "ERROR",
+        "fatal:",
+        "Fatal:",
+        "FATAL",
+        "panic:",
+        "PANIC",
         "command not found",
         "Permission denied",
         "No such file or directory",

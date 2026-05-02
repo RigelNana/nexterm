@@ -2,10 +2,10 @@
 //!
 //! SSH connection lifecycle, tunneling, ProxyJump, Multi-Exec, and keep-alive.
 
-pub mod connection;
-pub mod tunnel;
 pub mod config_parser;
+pub mod connection;
 pub mod multi_exec;
+pub mod tunnel;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

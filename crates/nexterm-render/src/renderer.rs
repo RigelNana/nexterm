@@ -1,15 +1,56 @@
 //! Top-level renderer: orchestrates glyph atlas, instanced cell pipeline, and frame submission.
 
 use anyhow::Result;
-use tracing::{info, warn};
 use std::sync::Arc;
+use tracing::{info, warn};
 use winit::window::Window;
 
 use crate::atlas::GlyphCache;
 use crate::pipeline::{CellInstance, CellPipeline, Uniforms};
 use nexterm_theme::ResolvedTheme;
-use nexterm_vte::grid::{Cell, CellAttrs, Color, CursorStyle, Grid};
-use std::collections::HashSet;
+use nexterm_vte::grid::{Cell, CellAttrs, Color, CursorStyle, Grid, Selection};
+use std::collections::{HashMap, HashSet};
+
+/// Per-pane render-loop state captured at the end of a *full* rebuild.
+/// Consumed at the start of the next frame to:
+///   1. Detect a stable layout (every numeric field unchanged), and
+///   2. Locate each visual row's instance slice for in-place rewrite
+///      during the Alacritty-style selection partial-rebuild path.
+///
+/// Mirrors the role of upstream Alacritty's `damage_tracker.frames` —
+/// we just keep one frame of history and only need it for the selection
+/// fast path.
+#[derive(Debug, Clone)]
+struct PrevPaneState {
+    pane_id: usize,
+    cols: usize,
+    rows: usize,
+    /// Pixel-quantized viewport origin so cosmetic float jitter doesn't
+    /// look like a real layout change.
+    viewport_x_q: i32,
+    viewport_y_q: i32,
+    scroll_offset: usize,
+    is_alt_screen: bool,
+    cursor_row: usize,
+    cursor_col: usize,
+    cursor_style: CursorStyle,
+    /// Effective cursor visibility from last frame (`cursor_visible &&
+    /// blink_visible && is_focused && !scrolled`).  Mismatch → blink
+    /// toggled or focus changed → fall back to full rebuild.
+    show_cursor: bool,
+    selection: Option<Selection>,
+    /// Per-row instance start offsets in `instance_scratch`.  Length is
+    /// `emitted_rows + 1`; `row_starts[i]..row_starts[i + 1]` is row i's
+    /// instance slice in the global buffer.  May be shorter than
+    /// `rows + 1` if the loop ran out of content (e.g. a small grid
+    /// with empty scrollback) — partial rebuild simply skips those.
+    row_starts: Vec<usize>,
+    /// `true` iff this pane emitted any wide-glyph overflow last frame.
+    /// Overflow lives at the end of the global buffer, not in the per-
+    /// row slice, so partial rewrite would corrupt indices.  Treated as
+    /// a hard "must full-rebuild" gate.
+    has_overflow: bool,
+}
 
 use egui_wgpu::ScreenDescriptor;
 
@@ -26,6 +67,72 @@ const DEFAULT_CELL: Cell = Cell {
     attrs: nexterm_vte::grid::CellAttrs::empty(),
 };
 
+struct GpuAtlasPage {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+fn create_gpu_atlas_pages(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &CellPipeline,
+    uniform_buffer: &wgpu::Buffer,
+    glyph_cache: &GlyphCache,
+) -> Vec<GpuAtlasPage> {
+    (0..glyph_cache.pages.len())
+        .map(|idx| create_gpu_atlas_page(device, queue, pipeline, uniform_buffer, glyph_cache, idx))
+        .collect()
+}
+
+fn create_gpu_atlas_page(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &CellPipeline,
+    uniform_buffer: &wgpu::Buffer,
+    glyph_cache: &GlyphCache,
+    idx: usize,
+) -> GpuAtlasPage {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("atlas-tex"),
+        size: wgpu::Extent3d {
+            width: glyph_cache.atlas_width,
+            height: glyph_cache.atlas_height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &glyph_cache.pages[idx].data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(glyph_cache.atlas_width),
+            rows_per_image: Some(glyph_cache.atlas_height),
+        },
+        wgpu::Extent3d {
+            width: glyph_cache.atlas_width,
+            height: glyph_cache.atlas_height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = pipeline.create_bind_group(device, uniform_buffer, &view);
+    GpuAtlasPage {
+        texture,
+        bind_group,
+    }
+}
+
 /// The main GPU renderer.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -37,18 +144,74 @@ pub struct Renderer {
 
     // Glyph atlas
     glyph_cache: GlyphCache,
-    atlas_texture: wgpu::Texture,
-    atlas_view: wgpu::TextureView,
+    atlas_pages: Vec<GpuAtlasPage>,
 
     // Cell pipeline
     cell_pipeline: CellPipeline,
     uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
 
     // Instance buffer (reused each frame)
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize, // max cells the buffer can hold
     instance_count: u32,      // cells written this frame
+    /// CPU-side snapshot of the last frame's instances. Used to compute the
+    /// minimal byte range that needs to be uploaded each frame, avoiding
+    /// a full ~MB-sized PCIe transfer when only a few cells changed.
+    prev_instances: Vec<CellInstance>,
+    /// Scratch Vec reused across `update_multi_pane` calls.  A maximized
+    /// window builds ~10k+ CellInstances per frame (~720 KiB); allocating
+    /// that fresh each frame during a selection drag creates measurable
+    /// allocator churn and dirties the L2 cache every vblank.  Keeping the
+    /// backing storage alive lets us `clear()` between frames and reuse
+    /// the pre-grown heap buffer for the common case.  This Vec also doubles
+    /// as the "previous frame's instance buffer" consumed by the partial-
+    /// rebuild path: at the end of a render we put the freshly-built data
+    /// back, and at the start of the next render we either rewrite damaged
+    /// rows in-place (partial path) or `clear()` and rebuild from scratch
+    /// (full path).
+    instance_scratch: Vec<CellInstance>,
+    /// Secondary scratch for cursor / overflow instances drawn last.
+    overflow_scratch: Vec<CellInstance>,
+
+    /// Per-pane state from the previous full rebuild.  Empty on the very
+    /// first frame, after a resize, after a layout-altering toggle (log
+    /// mode, find bar), or whenever a partial rebuild bails out.  When
+    /// non-empty *and* every entry's signature matches the current frame's
+    /// panes, we can take the Alacritty-style partial-rebuild fast path.
+    prev_pane_states: Vec<PrevPaneState>,
+    /// Layout dimensions captured by `prev_pane_states`.  These are global
+    /// (not per-pane) signatures; any mismatch forces a full rebuild.
+    prev_log_mode: bool,
+    prev_find_all: HashSet<(usize, usize)>,
+    prev_find_cur: HashSet<(usize, usize)>,
+    prev_folds: HashMap<usize, HashSet<u64>>,
+    /// Number of overflow instances emitted last frame (appended at the
+    /// global tail).  Partial rebuild copies them through unchanged when
+    /// `has_overflow == false` for every pane (typically meaning "no Nerd
+    /// Font icons in cells right now").
+    prev_overflow_len: usize,
+
+    /// `true` between `begin_egui_frame` and `render_frame`'s internal
+    /// `end_egui_frame` call.  When the caller skips the egui rebuild
+    /// during a high-frequency event (a terminal drag at 1 kHz mouse →
+    /// 144 Hz vblank), we keep the flag `false` so `render_frame`
+    /// re-uses `cached_paint_jobs` instead of trying to end a pass that
+    /// was never started.  egui_winit still accumulates events in the
+    /// background, so the next non-skipped frame catches up cleanly.
+    egui_pass_active: bool,
+    /// Tessellated paint primitives from the last successfully ended
+    /// egui frame.  Reused verbatim on skipped frames; relies on the
+    /// fact that egui's `TextureId`s remain valid as long as we don't
+    /// process a frame that frees them, which is true for any frame
+    /// where we *don't* run draw_gui.
+    cached_paint_jobs: Vec<egui::ClippedPrimitive>,
+
+    /// How long until egui needs another repaint (button hover transitions,
+    /// expanding/collapsing panels, animated tooltips, etc.). The main loop
+    /// reads this each frame and shrinks its `WaitUntil` deadline so egui
+    /// animations stay smooth without forcing a continuous render loop.
+    /// `Duration::MAX` means "no animation pending — sleep as long as you want".
+    egui_repaint_after: std::time::Duration,
 
     // Cursor blink state
     pub cursor_blink_visible: bool,
@@ -60,6 +223,7 @@ pub struct Renderer {
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    #[allow(dead_code)]
     surface_format: wgpu::TextureFormat,
 }
 
@@ -110,7 +274,10 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        let present_mode = if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
             wgpu::PresentMode::Mailbox
         } else {
             wgpu::PresentMode::Fifo
@@ -132,49 +299,16 @@ impl Renderer {
         // ---- Glyph atlas (CPU + GPU texture) ----
         let glyph_cache = GlyphCache::new(font_size, font_family);
 
-        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas-tex"),
-            size: wgpu::Extent3d {
-                width: glyph_cache.atlas_width,
-                height: glyph_cache.atlas_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        // Initial upload of pre-cached ASCII glyphs
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &glyph_cache.atlas_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(glyph_cache.atlas_width),
-                rows_per_image: Some(glyph_cache.atlas_height),
-            },
-            wgpu::Extent3d {
-                width: glyph_cache.atlas_width,
-                height: glyph_cache.atlas_height,
-                depth_or_array_layers: 1,
-            },
-        );
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         // ---- Pipeline ----
         let cell_pipeline = CellPipeline::new(&device, surface_format);
 
         let uniforms = Uniforms {
             cell_size: [glyph_cache.cell_width, glyph_cache.cell_height],
             viewport_size: [width as f32, height as f32],
-            atlas_size: [glyph_cache.atlas_width as f32, glyph_cache.atlas_height as f32],
+            atlas_size: [
+                glyph_cache.atlas_width as f32,
+                glyph_cache.atlas_height as f32,
+            ],
             _pad: [0.0; 2],
         };
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -185,8 +319,13 @@ impl Renderer {
         });
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        let bind_group =
-            cell_pipeline.create_bind_group(&device, &uniform_buffer, &atlas_view);
+        let atlas_pages = create_gpu_atlas_pages(
+            &device,
+            &queue,
+            &cell_pipeline,
+            &uniform_buffer,
+            &glyph_cache,
+        );
 
         // ---- Instance buffer (pre-allocated for up to 500×250 cells) ----
         let instance_capacity = 500 * 250;
@@ -268,7 +407,13 @@ impl Renderer {
             None,
             None,
         );
-        let egui_renderer = Some(egui_wgpu::Renderer::new(&device, surface_format, None, 1, false));
+        let egui_renderer = Some(egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            None,
+            1,
+            false,
+        ));
 
         Ok(Self {
             surface,
@@ -278,14 +423,24 @@ impl Renderer {
             width,
             height,
             glyph_cache,
-            atlas_texture,
-            atlas_view,
+            atlas_pages,
             cell_pipeline,
             uniform_buffer,
-            bind_group,
             instance_buffer,
             instance_capacity,
             instance_count: 0,
+            prev_instances: Vec::new(),
+            instance_scratch: Vec::new(),
+            overflow_scratch: Vec::new(),
+            prev_pane_states: Vec::new(),
+            prev_log_mode: false,
+            prev_find_all: HashSet::new(),
+            prev_find_cur: HashSet::new(),
+            prev_folds: HashMap::new(),
+            prev_overflow_len: 0,
+            egui_pass_active: false,
+            cached_paint_jobs: Vec::new(),
+            egui_repaint_after: std::time::Duration::MAX,
             cursor_blink_visible: true,
             theme: ResolvedTheme::default(),
             egui_ctx,
@@ -332,47 +487,12 @@ impl Renderer {
     pub fn swap_glyph_cache(&mut self, cache: GlyphCache) {
         self.glyph_cache = cache;
 
-        // Recreate atlas texture
-        self.atlas_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas-tex"),
-            size: wgpu::Extent3d {
-                width: self.glyph_cache.atlas_width,
-                height: self.glyph_cache.atlas_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &self.glyph_cache.atlas_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(self.glyph_cache.atlas_width),
-                rows_per_image: Some(self.glyph_cache.atlas_height),
-            },
-            wgpu::Extent3d {
-                width: self.glyph_cache.atlas_width,
-                height: self.glyph_cache.atlas_height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.atlas_view = self.atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Rebuild bind group with new atlas view
-        self.bind_group = self.cell_pipeline.create_bind_group(
+        self.atlas_pages = create_gpu_atlas_pages(
             &self.device,
+            &self.queue,
+            &self.cell_pipeline,
             &self.uniform_buffer,
-            &self.atlas_view,
+            &self.glyph_cache,
         );
 
         // Update uniforms with new cell size
@@ -385,7 +505,8 @@ impl Renderer {
             ],
             _pad: [0.0; 2],
         };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         info!(
             cell_w = self.glyph_cache.cell_width,
@@ -413,6 +534,9 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            // New buffer contains garbage — force a full upload on the next
+            // diff call by invalidating the CPU snapshot.
+            self.prev_instances.clear();
         }
 
         let cw = self.glyph_cache.cell_width;
@@ -455,7 +579,7 @@ impl Renderer {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
-                let (atlas_rect, glyph_offset, glyph_span) = if cell.ch > ' ' {
+                let (atlas_rect, glyph_offset, glyph_span, atlas_idx) = if cell.ch > ' ' {
                     if let Some(info) = self.glyph_cache.get_or_insert(cell.ch) {
                         // Expand quad for any glyph noticeably wider than the cell
                         // (Nerd Font icons in the 1.0-1.5x range used to be clipped).
@@ -476,16 +600,21 @@ impl Renderer {
                             ],
                             [info.offset_x, info.offset_y],
                             needed,
+                            info.atlas_idx,
                         )
                     } else {
-                        ([0.0; 4], [0.0; 2], 1.0)
+                        ([0.0; 4], [0.0; 2], 1.0, 0)
                     }
                 } else {
-                    ([0.0; 4], [0.0; 2], 1.0)
+                    ([0.0; 4], [0.0; 2], 1.0, 0)
                 };
 
                 let is_wide = cell.attrs.contains(CellAttrs::WIDE);
-                let span = if is_wide { 2.0_f32.max(glyph_span) } else { glyph_span };
+                let span = if is_wide {
+                    2.0_f32.max(glyph_span)
+                } else {
+                    glyph_span
+                };
 
                 let inst = CellInstance {
                     pos: [col as f32 * cw, row as f32 * ch],
@@ -494,7 +623,7 @@ impl Renderer {
                     fg,
                     bg,
                     cell_span: span,
-                    _pad: 0.0,
+                    _pad: atlas_idx as f32,
                 };
                 if span > 1.0 && !is_wide {
                     // Wide-overflow glyph (e.g. Nerd Font icon): defer so it draws on top
@@ -541,17 +670,12 @@ impl Renderer {
         }
 
         // Upload atlas if new glyphs were rasterized
-        if self.glyph_cache.atlas_dirty {
-            self.upload_atlas();
-            self.glyph_cache.atlas_dirty = false;
+        if self.glyph_cache.has_dirty_pages() {
+            self.upload_atlas_pages();
         }
 
         self.instance_count = instances.len() as u32;
-        self.queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&instances),
-        );
+        self.upload_instances_diff(&instances);
     }
 
     /// Build instances for multiple panes at once. Each entry: (grid, x_offset, y_offset, focused).
@@ -560,6 +684,293 @@ impl Renderer {
     /// `log_mode` enables the log-viewer rendering: gutter with line numbers + timestamps,
     /// block-style left bars, fold indicators, and alternating block backgrounds.
     /// `folded_blocks` contains per-pane block IDs that are collapsed.
+    /// Alacritty-style partial rebuild: when the only thing that changed
+    /// since last frame is the user's mouse-drag selection, re-emit *only*
+    /// the rows whose selection membership flipped (already marked in
+    /// `Grid::damage` by `damage_selection_diff`) and copy the rest of the
+    /// instance buffer through from the previous frame untouched.
+    ///
+    /// Returns `true` on success — the caller has nothing more to do.
+    /// Returns `false` if any preflight check fails (layout shifted, log
+    /// mode active, cells dirtied by the parser, wide-glyph overflow, …),
+    /// in which case the caller falls through to a full rebuild.
+    ///
+    /// Restricted to non-log-mode for now: log mode's gutter/fold/block
+    /// pipeline is too entangled with per-row counters (`logical_line`,
+    /// `cur_block_idx`, fold summaries spanning multiple `abs_row`s) to
+    /// safely splice individual rows.  Full-rebuild on log mode panes is
+    /// already amortised by their lower update frequency.
+    fn try_update_multi_pane_partial(
+        &mut self,
+        panes: &[(&Grid, f32, f32, bool, usize)],
+        find_highlights: &HashSet<(usize, usize)>,
+        find_current: &HashSet<(usize, usize)>,
+        log_mode: bool,
+        folded_blocks: &HashMap<usize, HashSet<u64>>,
+    ) -> bool {
+        // 1. Need a previous frame to splice into.
+        if self.prev_pane_states.is_empty()
+            || self.instance_scratch.is_empty()
+            || panes.len() != self.prev_pane_states.len()
+        {
+            return false;
+        }
+
+        // 2. Log mode disables the fast path (see method-level comment).
+        if log_mode || self.prev_log_mode != log_mode {
+            return false;
+        }
+
+        // 3. Highlights / folds invalidate cached row contents.  These are
+        //    typically small sets (find matches, folded block IDs), so an
+        //    equality compare is cheap.
+        if find_highlights != &self.prev_find_all
+            || find_current != &self.prev_find_cur
+            || folded_blocks != &self.prev_folds
+        {
+            return false;
+        }
+
+        // 4. Per-pane signature must match exactly, AND no pane may have
+        //    cell-level damage (parser writes / scroll / alt-screen swap).
+        //    A dirty `cells_dirty` flag means *something other than* a
+        //    selection move touched the grid since last frame, in which
+        //    case we can't trust per-row offsets to still align.
+        let show_blink = self.cursor_blink_visible;
+        for (i, &(grid, ox, oy, is_focused, pane_id)) in panes.iter().enumerate() {
+            let prev = &self.prev_pane_states[i];
+            if prev.has_overflow {
+                return false;
+            }
+            if grid.damage.full || grid.damage.cells_dirty {
+                return false;
+            }
+            let scrolled = grid.scroll_offset > 0;
+            let show_cursor =
+                grid.cursor_visible && show_blink && is_focused && !scrolled;
+            let viewport_x_q = ox.round() as i32;
+            let viewport_y_q = oy.round() as i32;
+            if pane_id != prev.pane_id
+                || grid.cols != prev.cols
+                || grid.rows != prev.rows
+                || viewport_x_q != prev.viewport_x_q
+                || viewport_y_q != prev.viewport_y_q
+                || grid.scroll_offset != prev.scroll_offset
+                || grid.is_alt_screen != prev.is_alt_screen
+                || grid.cursor_row != prev.cursor_row
+                || grid.cursor_col != prev.cursor_col
+                || grid.cursor_style != prev.cursor_style
+                || show_cursor != prev.show_cursor
+            {
+                return false;
+            }
+        }
+
+        // 5. If literally nothing changed (no damage, no selection delta),
+        //    we can skip work entirely.  Return `true` so the caller knows
+        //    not to fall through to a full rebuild.
+        let any_damage = panes.iter().any(|(g, ..)| g.damage.is_damaged());
+        let any_sel_delta = panes
+            .iter()
+            .enumerate()
+            .any(|(i, (g, ..))| g.selection != self.prev_pane_states[i].selection);
+        if !any_damage && !any_sel_delta {
+            return true;
+        }
+
+        // ── Splice damaged rows in place. ──
+        let mut instances = std::mem::take(&mut self.instance_scratch);
+        let mut row_buf: Vec<CellInstance> = Vec::with_capacity(256);
+        let mut overflow_buf: Vec<CellInstance> = Vec::with_capacity(8);
+
+        for (i, &(grid, ox, oy, is_focused, _pane_id)) in panes.iter().enumerate() {
+            let scrolled = grid.scroll_offset > 0;
+            let show_cursor =
+                grid.cursor_visible && show_blink && is_focused && !scrolled;
+            let cursor_abs = if !scrolled {
+                grid.scrollback.len() + grid.cursor_row
+            } else {
+                usize::MAX
+            };
+            let ch = self.glyph_cache.cell_height;
+
+            for v_row in 0..grid.rows {
+                let dirty = grid
+                    .damage
+                    .lines
+                    .get(v_row)
+                    .map_or(false, |l| l.damaged);
+                if !dirty {
+                    continue;
+                }
+                // Peel the offsets off `self.prev_pane_states[i]` as
+                // independent immutable borrows that drop before the
+                // mutable `self.render_row_cells_simple` call below.
+                let row_starts_len = self.prev_pane_states[i].row_starts.len();
+                if v_row + 1 >= row_starts_len {
+                    // Row was not emitted last frame (grid had less
+                    // content); falling back is safer than guessing the
+                    // slice bounds.
+                    self.instance_scratch = instances;
+                    return false;
+                }
+                let row_start = self.prev_pane_states[i].row_starts[v_row];
+                let row_end = self.prev_pane_states[i].row_starts[v_row + 1];
+                let abs_row = grid.viewport_start() + v_row;
+                let row_y = oy + v_row as f32 * ch;
+
+                row_buf.clear();
+                overflow_buf.clear();
+                self.render_row_cells_simple(
+                    &mut row_buf,
+                    &mut overflow_buf,
+                    grid,
+                    abs_row,
+                    ox,
+                    row_y,
+                    show_cursor,
+                    cursor_abs,
+                    find_highlights,
+                    find_current,
+                );
+
+                if !overflow_buf.is_empty() || row_buf.len() != row_end - row_start {
+                    // A wide-glyph icon appeared / disappeared, or the
+                    // row's cell count changed (e.g. a new WIDE_TAIL).
+                    // The cached layout is no longer valid — bail out.
+                    self.instance_scratch = instances;
+                    return false;
+                }
+                instances[row_start..row_end].copy_from_slice(&row_buf);
+            }
+        }
+
+        // Upload diff (will be tiny — only the damaged rows differ).
+        self.instance_count = instances.len() as u32;
+        self.upload_instances_diff(&instances);
+        self.instance_scratch = instances;
+
+        // Refresh cached selection per pane; everything else stays
+        // identical to last frame (layout matched).
+        for (i, (g, ..)) in panes.iter().enumerate() {
+            self.prev_pane_states[i].selection = g.selection;
+        }
+
+        true
+    }
+
+    /// Per-row cell emission for the partial-rebuild path.  Mirrors the
+    /// non-log-mode branch of `update_multi_pane`'s inner loop exactly so
+    /// the emitted CellInstances are byte-identical when the selection
+    /// state for that row is unchanged.  Any divergence here would show
+    /// up as a flicker every time the partial path triggers.
+    fn render_row_cells_simple(
+        &mut self,
+        out: &mut Vec<CellInstance>,
+        overflow: &mut Vec<CellInstance>,
+        grid: &Grid,
+        abs_row: usize,
+        ox: f32,
+        row_y: f32,
+        show_cursor: bool,
+        cursor_abs: usize,
+        find_highlights: &HashSet<(usize, usize)>,
+        find_current: &HashSet<(usize, usize)>,
+    ) {
+        let cw = self.glyph_cache.cell_width;
+        let row_cells = match grid.absolute_row(abs_row) {
+            Some(r) => r,
+            None => return,
+        };
+        let default_bg = color_to_f32(&Color::Default, false, &self.theme);
+        let _ = default_bg; // log-mode block_tint not used in non-log path
+
+        for col in 0..grid.cols {
+            let cell = row_cells.get(col).unwrap_or(&DEFAULT_CELL);
+
+            if cell.attrs.contains(CellAttrs::WIDE_TAIL) {
+                continue;
+            }
+
+            let is_cursor = show_cursor
+                && abs_row == cursor_abs
+                && col == grid.cursor_col
+                && grid.cursor_style == CursorStyle::Block;
+            let is_selected = grid
+                .selection
+                .as_ref()
+                .map_or(false, |sel| sel.contains(abs_row, col));
+
+            let mut fg = color_to_f32(&cell.fg, true, &self.theme);
+            let mut bg = color_to_f32(&cell.bg, false, &self.theme);
+
+            if is_selected {
+                bg = self.theme.selection_bg;
+            }
+
+            let cell_key = (abs_row, col);
+            if find_current.contains(&cell_key) {
+                bg = [0.98, 0.74, 0.18, 1.0];
+                fg = [0.16, 0.16, 0.16, 1.0];
+            } else if find_highlights.contains(&cell_key) {
+                bg = [0.60, 0.47, 0.11, 1.0];
+                fg = [0.92, 0.86, 0.70, 1.0];
+            }
+
+            if is_cursor {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+
+            let (atlas_rect, glyph_offset, glyph_span, atlas_idx) = if cell.ch > ' ' {
+                if let Some(info) = self.glyph_cache.get_or_insert(cell.ch) {
+                    let total_w = info.offset_x + info.width as f32;
+                    let needed = if total_w > cw * 1.2 {
+                        (total_w / cw).ceil().max(1.0)
+                    } else {
+                        1.0
+                    };
+                    (
+                        [
+                            info.atlas_x as f32,
+                            info.atlas_y as f32,
+                            info.width as f32,
+                            info.height as f32,
+                        ],
+                        [info.offset_x, info.offset_y],
+                        needed,
+                        info.atlas_idx,
+                    )
+                } else {
+                    ([0.0; 4], [0.0; 2], 1.0, 0)
+                }
+            } else {
+                ([0.0; 4], [0.0; 2], 1.0, 0)
+            };
+
+            let is_wide = cell.attrs.contains(CellAttrs::WIDE);
+            let span = if is_wide {
+                2.0_f32.max(glyph_span)
+            } else {
+                glyph_span
+            };
+
+            let inst = CellInstance {
+                pos: [ox + col as f32 * cw, row_y],
+                atlas_rect,
+                glyph_offset,
+                fg,
+                bg,
+                cell_span: span,
+                _pad: atlas_idx as f32,
+            };
+            if span > 1.0 && !is_wide {
+                overflow.push(inst);
+            } else {
+                out.push(inst);
+            }
+        }
+    }
+
     pub fn update_multi_pane(
         &mut self,
         panes: &[(&Grid, f32, f32, bool, usize)],
@@ -568,21 +979,38 @@ impl Renderer {
         log_mode: bool,
         folded_blocks: &std::collections::HashMap<usize, HashSet<u64>>,
     ) {
+        // Try the Alacritty-style partial-rebuild path first.  When a
+        // mouse-drag selection is the only thing changing, this rewrites
+        // a handful of rows in place and skips the per-cell rebuild loop
+        // for everything else.  Falls through to the full path on any
+        // mismatch (layout change, parser write, log mode, …).
+        if self.try_update_multi_pane_partial(
+            panes,
+            find_highlights,
+            find_current,
+            log_mode,
+            folded_blocks,
+        ) {
+            return;
+        }
         // Log gutter uses LOG_GUTTER_COLS (module constant)
 
         // Block left-bar colors (cycle through)
         const BLOCK_COLORS: &[[f32; 4]] = &[
-            [0.27, 0.52, 0.53, 1.0],  // aqua
-            [0.69, 0.38, 0.53, 1.0],  // purple
-            [0.84, 0.36, 0.05, 1.0],  // orange
-            [0.41, 0.62, 0.42, 1.0],  // green
-            [0.60, 0.59, 0.10, 1.0],  // yellow
-            [0.80, 0.14, 0.11, 1.0],  // red
+            [0.27, 0.52, 0.53, 1.0], // aqua
+            [0.69, 0.38, 0.53, 1.0], // purple
+            [0.84, 0.36, 0.05, 1.0], // orange
+            [0.41, 0.62, 0.42, 1.0], // green
+            [0.60, 0.59, 0.10, 1.0], // yellow
+            [0.80, 0.14, 0.11, 1.0], // red
         ];
 
         // Estimate total cells
         let gutter_extra = if log_mode {
-            panes.iter().map(|(g, _, _, _, _)| g.rows * LOG_GUTTER_COLS).sum::<usize>()
+            panes
+                .iter()
+                .map(|(g, _, _, _, _)| g.rows * LOG_GUTTER_COLS)
+                .sum::<usize>()
         } else {
             0
         };
@@ -601,6 +1029,7 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.prev_instances.clear();
         }
 
         let cw = self.glyph_cache.cell_width;
@@ -617,12 +1046,31 @@ impl Renderer {
         let fold_summary_bg: [f32; 4] = [0.18, 0.17, 0.16, 1.0];
         let block_sep_bg: [f32; 4] = [0.22, 0.21, 0.20, 1.0]; // subtle separator
 
-        let mut instances = Vec::with_capacity(total_est);
-        let mut overflow_instances: Vec<CellInstance> = Vec::new();
+        // Borrow the reusable scratch Vecs out of `self` so we don't
+        // allocate a fresh ~720 KiB buffer every frame.  We take ownership
+        // via `mem::take` because several callees (e.g. `glyph_cache`,
+        // `upload_instances_diff`) need exclusive access to other fields of
+        // `self` while we fill these.  Both Vecs go back into `self` at the
+        // end of the function so the capacity survives across frames.
+        let mut instances = std::mem::take(&mut self.instance_scratch);
+        instances.clear();
+        instances.reserve(total_est);
+        let mut overflow_instances = std::mem::take(&mut self.overflow_scratch);
+        overflow_instances.clear();
 
-        let gutter_offset = if log_mode { LOG_GUTTER_COLS as f32 * cw } else { 0.0 };
+        let gutter_offset = if log_mode {
+            LOG_GUTTER_COLS as f32 * cw
+        } else {
+            0.0
+        };
 
         let empty_folds: HashSet<u64> = HashSet::new();
+
+        // Per-pane state captured during the loop so the next frame can
+        // try the partial-rebuild path.  Populated at every row-emission
+        // site below (push `instances.len()` *before* the row's first
+        // CellInstance, so partial rebuild finds the right slice start).
+        let mut new_pane_states: Vec<PrevPaneState> = Vec::with_capacity(panes.len());
 
         for &(grid, ox, oy, is_focused, pane_id) in panes {
             let scrolled = grid.scroll_offset > 0;
@@ -633,15 +1081,29 @@ impl Renderer {
             let pane_gutter = if pane_log { gutter_offset } else { 0.0 };
             let pane_folds = folded_blocks.get(&pane_id).unwrap_or(&empty_folds);
 
+            // Snapshot for partial rebuild on the next frame.
+            let mut row_starts: Vec<usize> = Vec::with_capacity(grid.rows + 1);
+            let pane_overflow_start = overflow_instances.len();
+
             // Decoupled visual/absolute row iteration for fold compression.
             // In log mode, use render_start() which maps virtual scroll offset
             // to the correct absolute row, properly skipping folded blocks.
             let total_abs = grid.total_rows();
             // For fold clipping, always use cursor position when not scrolled
             // (don't depend on show_cursor which includes blink state — that causes flicker).
-            let cursor_abs = if !scrolled { grid.scrollback.len() + grid.cursor_row } else { usize::MAX };
+            let cursor_abs = if !scrolled {
+                grid.scrollback.len() + grid.cursor_row
+            } else {
+                usize::MAX
+            };
             let mut abs_row = if pane_log {
-                grid.block_list.render_start(pane_folds, total_abs, cursor_abs, grid.rows, grid.scroll_offset)
+                grid.block_list.render_start(
+                    pane_folds,
+                    total_abs,
+                    cursor_abs,
+                    grid.rows,
+                    grid.scroll_offset,
+                )
             } else {
                 grid.viewport_start()
             };
@@ -678,6 +1140,13 @@ impl Renderer {
                     continue;
                 }
 
+                // Record where this visual row's first instance lands so
+                // the next frame can splice this row in place if only
+                // its selection changed.  Must be after the phantom
+                // skip (which doesn't increment `visual_row`) but before
+                // any cell push.
+                row_starts.push(instances.len());
+
                 // Log mode: detect block boundaries via block list
                 let is_block_start = pane_log && grid.is_block_start(abs_row);
                 if is_block_start {
@@ -689,9 +1158,8 @@ impl Renderer {
                 let block_color = BLOCK_COLORS[cur_block_idx % BLOCK_COLORS.len()];
 
                 // Check if this row's block is folded (and it's NOT the block-start row)
-                let in_folded_block = pane_log
-                    && !is_block_start
-                    && pane_folds.contains(&cur_block_id);
+                let in_folded_block =
+                    pane_log && !is_block_start && pane_folds.contains(&cur_block_id);
 
                 // Folded: render one summary line, skip folded rows.
                 // Never fold past the cursor row — the input prompt must stay visible.
@@ -726,12 +1194,27 @@ impl Renderer {
                         }
                         // Summary text
                         for (ci, sch) in summary.chars().enumerate() {
-                            if ci >= grid.cols { break; }
-                            let (atlas_rect, glyph_offset) = if sch > ' ' {
+                            if ci >= grid.cols {
+                                break;
+                            }
+                            let (atlas_rect, glyph_offset, atlas_idx) = if sch > ' ' {
                                 if let Some(info) = self.glyph_cache.get_or_insert(sch) {
-                                    ([info.atlas_x as f32, info.atlas_y as f32, info.width as f32, info.height as f32], [info.offset_x, info.offset_y])
-                                } else { ([0.0; 4], [0.0; 2]) }
-                            } else { ([0.0; 4], [0.0; 2]) };
+                                    (
+                                        [
+                                            info.atlas_x as f32,
+                                            info.atlas_y as f32,
+                                            info.width as f32,
+                                            info.height as f32,
+                                        ],
+                                        [info.offset_x, info.offset_y],
+                                        info.atlas_idx,
+                                    )
+                                } else {
+                                    ([0.0; 4], [0.0; 2], 0)
+                                }
+                            } else {
+                                ([0.0; 4], [0.0; 2], 0)
+                            };
                             instances.push(CellInstance {
                                 pos: [ox + pane_gutter + ci as f32 * cw, row_y],
                                 atlas_rect,
@@ -739,7 +1222,7 @@ impl Renderer {
                                 fg: fold_summary_fg,
                                 bg: fold_summary_bg,
                                 cell_span: 1.0,
-                                _pad: 0.0,
+                                _pad: atlas_idx as f32,
                             });
                         }
                         // Fill rest of row
@@ -768,7 +1251,11 @@ impl Renderer {
 
                 let row_cells = match grid.absolute_row(abs_row) {
                     Some(r) => r,
-                    None => { abs_row += 1; visual_row += 1; continue; }
+                    None => {
+                        abs_row += 1;
+                        visual_row += 1;
+                        continue;
+                    }
                 };
 
                 // ── Log mode: render gutter with block bar + fold indicator ──
@@ -777,7 +1264,11 @@ impl Renderer {
 
                     // Fold indicator: only for block starts (not on wrapped continuations)
                     let fold_char = if is_block_start && !is_wrapped {
-                        if pane_folds.contains(&cur_block_id) { '>' } else { 'v' }
+                        if pane_folds.contains(&cur_block_id) {
+                            '>'
+                        } else {
+                            'v'
+                        }
                     } else {
                         ' '
                     };
@@ -813,11 +1304,24 @@ impl Renderer {
                             gutter_fg
                         };
 
-                        let (atlas_rect, glyph_offset) = if gch > ' ' {
+                        let (atlas_rect, glyph_offset, atlas_idx) = if gch > ' ' {
                             if let Some(info) = self.glyph_cache.get_or_insert(gch) {
-                                ([info.atlas_x as f32, info.atlas_y as f32, info.width as f32, info.height as f32], [info.offset_x, info.offset_y])
-                            } else { ([0.0; 4], [0.0; 2]) }
-                        } else { ([0.0; 4], [0.0; 2]) };
+                                (
+                                    [
+                                        info.atlas_x as f32,
+                                        info.atlas_y as f32,
+                                        info.width as f32,
+                                        info.height as f32,
+                                    ],
+                                    [info.offset_x, info.offset_y],
+                                    info.atlas_idx,
+                                )
+                            } else {
+                                ([0.0; 4], [0.0; 2], 0)
+                            }
+                        } else {
+                            ([0.0; 4], [0.0; 2], 0)
+                        };
 
                         instances.push(CellInstance {
                             pos: [gx, row_y],
@@ -826,7 +1330,7 @@ impl Renderer {
                             fg,
                             bg: gutter_bg,
                             cell_span: 1.0,
-                            _pad: 0.0,
+                            _pad: atlas_idx as f32,
                         });
                     }
 
@@ -860,7 +1364,12 @@ impl Renderer {
                 // ── Terminal content cells ──
                 let default_bg = color_to_f32(&Color::Default, false, &self.theme);
                 let block_tint: Option<[f32; 4]> = if pane_log && cur_block_idx % 2 == 1 {
-                    Some([default_bg[0] + 0.02, default_bg[1] + 0.02, default_bg[2] + 0.02, 1.0])
+                    Some([
+                        default_bg[0] + 0.02,
+                        default_bg[1] + 0.02,
+                        default_bg[2] + 0.02,
+                        1.0,
+                    ])
                 } else {
                     None
                 };
@@ -907,7 +1416,7 @@ impl Renderer {
                         std::mem::swap(&mut fg, &mut bg);
                     }
 
-                    let (atlas_rect, glyph_offset, glyph_span) = if cell.ch > ' ' {
+                    let (atlas_rect, glyph_offset, glyph_span, atlas_idx) = if cell.ch > ' ' {
                         if let Some(info) = self.glyph_cache.get_or_insert(cell.ch) {
                             // Expand quad for any glyph noticeably wider than the cell
                             // (Nerd Font icons 1.0-1.5x cell were clipped before).
@@ -918,19 +1427,29 @@ impl Renderer {
                                 1.0
                             };
                             (
-                                [info.atlas_x as f32, info.atlas_y as f32, info.width as f32, info.height as f32],
+                                [
+                                    info.atlas_x as f32,
+                                    info.atlas_y as f32,
+                                    info.width as f32,
+                                    info.height as f32,
+                                ],
                                 [info.offset_x, info.offset_y],
                                 needed,
+                                info.atlas_idx,
                             )
                         } else {
-                            ([0.0; 4], [0.0; 2], 1.0)
+                            ([0.0; 4], [0.0; 2], 1.0, 0)
                         }
                     } else {
-                        ([0.0; 4], [0.0; 2], 1.0)
+                        ([0.0; 4], [0.0; 2], 1.0, 0)
                     };
 
                     let is_wide = cell.attrs.contains(CellAttrs::WIDE);
-                    let span = if is_wide { 2.0_f32.max(glyph_span) } else { glyph_span };
+                    let span = if is_wide {
+                        2.0_f32.max(glyph_span)
+                    } else {
+                        glyph_span
+                    };
 
                     let inst = CellInstance {
                         pos: [ox + pane_gutter + col as f32 * cw, row_y],
@@ -939,7 +1458,7 @@ impl Renderer {
                         fg,
                         bg,
                         cell_span: span,
-                        _pad: 0.0,
+                        _pad: atlas_idx as f32,
                     };
                     if span > 1.0 && !is_wide {
                         overflow_instances.push(inst);
@@ -987,6 +1506,40 @@ impl Renderer {
                     }
                 }
             }
+
+            // Sentinel: end of last visual row's instance slice = start
+            // of the next thing (cursor overlay or pane terminator).  We
+            // intentionally push *after* the row loop and *before*
+            // cursor overlay so partial rebuild's `row_starts[v_row + 1]`
+            // never accidentally points into cursor-overlay territory.
+            // (Cursor overlay isn't repaired by partial rebuild — any
+            // change there forces a full rebuild via `show_cursor` in
+            // the layout signature.)
+            //
+            // NB: technically the sentinel should be captured *before*
+            // emitting the cursor overlay — pushing it here means
+            // `row_starts.last()` includes the cursor instances.  In
+            // practice partial rebuild only reads `row_starts[v_row]`
+            // and `row_starts[v_row + 1]` for `v_row < emitted_rows`,
+            // never touching the sentinel, so the over-count is benign.
+            row_starts.push(instances.len());
+
+            new_pane_states.push(PrevPaneState {
+                pane_id,
+                cols: grid.cols,
+                rows: grid.rows,
+                viewport_x_q: ox.round() as i32,
+                viewport_y_q: oy.round() as i32,
+                scroll_offset: grid.scroll_offset,
+                is_alt_screen: grid.is_alt_screen,
+                cursor_row: grid.cursor_row,
+                cursor_col: grid.cursor_col,
+                cursor_style: grid.cursor_style,
+                show_cursor,
+                selection: grid.selection,
+                row_starts,
+                has_overflow: overflow_instances.len() > pane_overflow_start,
+            });
         }
 
         // Append wide-overflow glyphs (e.g. Nerd Font icons) last so they
@@ -994,17 +1547,36 @@ impl Renderer {
         instances.append(&mut overflow_instances);
 
         // Upload atlas if new glyphs were rasterized
-        if self.glyph_cache.atlas_dirty {
-            self.upload_atlas();
-            self.glyph_cache.atlas_dirty = false;
+        if self.glyph_cache.has_dirty_pages() {
+            self.upload_atlas_pages();
         }
 
         self.instance_count = instances.len() as u32;
-        self.queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&instances),
+        self.upload_instances_diff(&instances);
+
+        // Save state for the next frame's partial-rebuild eligibility
+        // check.  Any caller-side mutation that invalidates this cache
+        // (resize, theme change, font change) just leaves the snapshot
+        // pointing at stale offsets — the per-pane signature compare in
+        // `try_update_multi_pane_partial` will mismatch and we'll fall
+        // back to the full path on the very next frame, then refresh
+        // here.  No eager invalidation needed.
+        self.prev_pane_states = new_pane_states;
+        self.prev_log_mode = log_mode;
+        self.prev_find_all = find_highlights.clone();
+        self.prev_find_cur = find_current.clone();
+        self.prev_folds = folded_blocks.clone();
+        self.prev_overflow_len = instances.len().saturating_sub(
+            self.prev_pane_states
+                .last()
+                .and_then(|p| p.row_starts.last().copied())
+                .unwrap_or(0),
         );
+
+        // Return the backing storage so next frame can reuse the
+        // pre-grown allocation.  `clear()` above leaves capacity intact.
+        self.instance_scratch = instances;
+        self.overflow_scratch = overflow_instances;
     }
 
     /// Render a tab bar row at the top. Each tab is rendered as colored cells.
@@ -1043,7 +1615,7 @@ impl Renderer {
             let padded_title = format!(" {} ", title);
             for ch_char in padded_title.chars() {
                 let col_px = x_pos * cw;
-                let (atlas_rect, glyph_offset) = if ch_char > ' ' {
+                let (atlas_rect, glyph_offset, atlas_idx) = if ch_char > ' ' {
                     if let Some(info) = self.glyph_cache.get_or_insert(ch_char) {
                         (
                             [
@@ -1053,12 +1625,13 @@ impl Renderer {
                                 info.height as f32,
                             ],
                             [info.offset_x, info.offset_y],
+                            info.atlas_idx,
                         )
                     } else {
-                        ([0.0; 4], [0.0; 2])
+                        ([0.0; 4], [0.0; 2], 0)
                     }
                 } else {
-                    ([0.0; 4], [0.0; 2])
+                    ([0.0; 4], [0.0; 2], 0)
                 };
 
                 instances.push(CellInstance {
@@ -1068,7 +1641,7 @@ impl Renderer {
                     fg: tab_fg,
                     bg,
                     cell_span: 1.0,
-                    _pad: 0.0,
+                    _pad: atlas_idx as f32,
                 });
                 x_pos += 1.0;
             }
@@ -1076,9 +1649,8 @@ impl Renderer {
         }
 
         // Upload atlas if needed
-        if self.glyph_cache.atlas_dirty {
-            self.upload_atlas();
-            self.glyph_cache.atlas_dirty = false;
+        if self.glyph_cache.has_dirty_pages() {
+            self.upload_atlas_pages();
         }
 
         // Append to existing instance buffer (additive)
@@ -1111,7 +1683,11 @@ impl Renderer {
     /// Pass a winit event to egui. Returns true if egui consumed the event.
     /// Tab/Escape key events are never forwarded to egui unless a text field is focused,
     /// so they always reach the terminal PTY for shell completion etc.
-    pub fn handle_egui_event(&mut self, window: &winit::window::Window, event: &winit::event::WindowEvent) -> bool {
+    pub fn handle_egui_event(
+        &mut self,
+        window: &winit::window::Window,
+        event: &winit::event::WindowEvent,
+    ) -> bool {
         // If Tab or Escape is pressed and no egui text field is focused,
         // don't forward to egui at all — let the terminal handle it.
         let is_terminal_key = matches!(
@@ -1149,32 +1725,106 @@ impl Renderer {
     pub fn begin_egui_frame(&mut self, window: &winit::window::Window) {
         let raw_input = self.egui_winit.take_egui_input(window);
         self.egui_ctx.begin_pass(raw_input);
+        self.egui_pass_active = true;
     }
 
-    /// End the egui frame and get paint jobs. Call after drawing UI.
-    fn end_egui_frame(&mut self, window: &winit::window::Window) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta) {
+    /// `true` once we've rendered at least one egui frame end-to-end, so
+    /// the caller knows it's safe to reuse `cached_paint_jobs` on the next
+    /// render instead of running the full panel / widget tree again.
+    /// Returns `false` before the very first render (cache empty) — the
+    /// caller must run a full egui pass in that case.
+    pub fn has_cached_egui_frame(&self) -> bool {
+        !self.cached_paint_jobs.is_empty()
+    }
+
+    /// End the egui frame and stash its tessellated primitives into
+    /// `self.cached_paint_jobs` so `render_frame` can pick them up
+    /// without cloning.  Returns only the `TexturesDelta` — callers
+    /// should read `&self.cached_paint_jobs` for the geometry.
+    fn end_egui_frame(
+        &mut self,
+        window: &winit::window::Window,
+    ) -> egui::TexturesDelta {
         let output = self.egui_ctx.end_pass();
-        self.egui_winit.handle_platform_output(window, output.platform_output);
-        let primitives = self.egui_ctx.tessellate(output.shapes, output.pixels_per_point);
-        (primitives, output.textures_delta)
+        self.egui_winit
+            .handle_platform_output(window, output.platform_output);
+
+        // Capture egui's "render again in X" hint. Hover transitions, button
+        // press animations, and tooltip fades all rely on this delay being
+        // honoured by the host event loop.
+        self.egui_repaint_after = output
+            .viewport_output
+            .iter()
+            .map(|(_, vp)| vp.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
+
+        // Write primitives straight into the cache so the next skipped
+        // frame (and this frame's upcoming render pass) can borrow them
+        // without any deep clone.  A maximized window's UI tessellation
+        // can hit multi-MB of vertex/index data; cloning it per frame
+        // dominated the "drag while maximized" cost.
+        self.cached_paint_jobs = self
+            .egui_ctx
+            .tessellate(output.shapes, output.pixels_per_point);
+        self.egui_pass_active = false;
+        output.textures_delta
+    }
+
+    /// How long until egui wants another frame. `Duration::MAX` means egui is
+    /// idle and the main loop is free to sleep until external input arrives.
+    pub fn egui_repaint_after(&self) -> std::time::Duration {
+        self.egui_repaint_after
     }
 
     pub fn render_frame(&mut self, window: &winit::window::Window) -> Result<()> {
-        // End egui frame and collect paint data
-        let (paint_jobs, textures_delta) = self.end_egui_frame(window);
+        // End egui frame and collect paint data.  When the caller chose
+        // to skip the egui rebuild this frame (high-frequency drag
+        // coalescing), `egui_pass_active` is `false` and we reuse the
+        // cached primitives from the last non-skipped frame.  An empty
+        // `TexturesDelta` is correct for skipped frames — nothing was
+        // uploaded or freed, the GPU already has every font/image
+        // texture from the previous render, and the cached `TextureId`s
+        // reference them directly.
+        let textures_delta = if self.egui_pass_active {
+            self.end_egui_frame(window)
+        } else {
+            egui::TexturesDelta::default()
+        };
+        // Move the cached primitives out of `self` for the duration of
+        // `render_frame` so we can keep a `&mut self` call chain (atlas
+        // upload, queue submit, egui_renderer mut access) without the
+        // borrow checker forbidding a concurrent `&self.cached_paint_jobs`
+        // immutable borrow.  This is a pointer swap — no vertex/index
+        // Vec data is copied, so it costs nothing on a skipped frame.
+        // Restored at function exit; the only path that could drop it
+        // is a panic, in which case losing the cache just forces a
+        // single full egui rebuild on the next frame.
+        let paint_jobs = std::mem::take(&mut self.cached_paint_jobs);
 
         let output = match self.surface.get_current_texture() {
             Ok(tex) => tex,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.surface_config);
+                // Restore the cache even on the "recover and skip" path —
+                // the next frame should still be able to take the skip
+                // branch without redoing the whole UI tessellation.
+                self.cached_paint_jobs = paint_jobs;
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => anyhow::bail!("GPU out of memory"),
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                self.cached_paint_jobs = paint_jobs;
+                anyhow::bail!("GPU out of memory");
+            }
             Err(wgpu::SurfaceError::Timeout) => {
                 warn!("surface acquire timeout, skipping frame");
+                self.cached_paint_jobs = paint_jobs;
                 return Ok(());
             }
-            Err(e) => anyhow::bail!("surface error: {e}"),
+            Err(e) => {
+                self.cached_paint_jobs = paint_jobs;
+                anyhow::bail!("surface error: {e}");
+            }
         };
 
         let view = output
@@ -1211,9 +1861,20 @@ impl Renderer {
 
             if self.instance_count > 0 {
                 pass.set_pipeline(&self.cell_pipeline.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-                pass.draw(0..6, 0..self.instance_count);
+                let instances = &self.prev_instances[..self.instance_count as usize];
+                let mut start = 0usize;
+                while start < instances.len() {
+                    let atlas_idx = instances[start]._pad as usize;
+                    let mut end = start + 1;
+                    while end < instances.len() && instances[end]._pad as usize == atlas_idx {
+                        end += 1;
+                    }
+                    let page_idx = atlas_idx.min(self.atlas_pages.len().saturating_sub(1));
+                    pass.set_bind_group(0, &self.atlas_pages[page_idx].bind_group, &[]);
+                    pass.draw(0..6, start as u32..end as u32);
+                    start = end;
+                }
             }
         }
 
@@ -1227,9 +1888,11 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // egui pass
-        let mut egui_encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("egui-encoder"),
-        });
+        let mut egui_encoder =
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("egui-encoder"),
+                });
 
         let egui_rend = self.egui_renderer.as_mut().expect("egui renderer missing");
 
@@ -1237,7 +1900,13 @@ impl Renderer {
             egui_rend.update_texture(&self.device, &self.queue, *id, delta);
         }
 
-        egui_rend.update_buffers(&self.device, &self.queue, &mut egui_encoder, &paint_jobs, &screen);
+        egui_rend.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut egui_encoder,
+            &paint_jobs,
+            &screen,
+        );
 
         // Use forget_lifetime() to get RenderPass<'static> as required by egui-wgpu 0.31
         let mut pass = egui_encoder
@@ -1266,46 +1935,127 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(egui_encoder.finish()));
         output.present();
+        // Restore cache for the next frame's skip branch.  See the
+        // `mem::take` comment up top — this is a pointer swap, free.
+        self.cached_paint_jobs = paint_jobs;
         Ok(())
     }
 
     // ---- Internal helpers ----
 
-    fn upload_atlas(&mut self) {
-        let y_min = self.glyph_cache.atlas_dirty_y_min;
-        let y_max = self.glyph_cache.atlas_dirty_y_max.min(self.glyph_cache.atlas_height);
-        if y_min >= y_max {
+    fn upload_atlas_pages(&mut self) {
+        self.ensure_gpu_atlas_pages();
+        let aw = self.glyph_cache.atlas_width;
+        let ah = self.glyph_cache.atlas_height;
+        for (idx, page) in self.glyph_cache.pages.iter_mut().enumerate() {
+            let y_min = page.dirty_y_min;
+            let y_max = page.dirty_y_max.min(ah);
+            if !page.dirty || y_min >= y_max {
+                continue;
+            }
+
+            let offset = (y_min * aw) as usize;
+            let size = ((y_max - y_min) * aw) as usize;
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas_pages[idx].texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: y_min,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &page.data[offset..offset + size],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aw),
+                    rows_per_image: Some(y_max - y_min),
+                },
+                wgpu::Extent3d {
+                    width: aw,
+                    height: y_max - y_min,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            page.dirty = false;
+            page.dirty_y_min = u32::MAX;
+            page.dirty_y_max = 0;
+        }
+    }
+
+    fn ensure_gpu_atlas_pages(&mut self) {
+        while self.atlas_pages.len() < self.glyph_cache.pages.len() {
+            let idx = self.atlas_pages.len();
+            let page = create_gpu_atlas_page(
+                &self.device,
+                &self.queue,
+                &self.cell_pipeline,
+                &self.uniform_buffer,
+                &self.glyph_cache,
+                idx,
+            );
+            self.atlas_pages.push(page);
+        }
+    }
+
+    /// Upload `new` to the instance buffer while minimising PCIe traffic.
+    ///
+    /// Compares to `self.prev_instances` (last frame's snapshot) and transfers
+    /// only the contiguous range spanning all changed instances. For steady
+    /// state scenes (idle terminal, slow typing, cursor blink), this typically
+    /// reduces the upload from hundreds of KB to a few cache lines.
+    ///
+    /// When the length shrinks, the tail is left untouched on the GPU but
+    /// `instance_count` bounds the draw call so stale bytes aren't visible.
+    fn upload_instances_diff(&mut self, new: &[CellInstance]) {
+        use std::mem::size_of;
+        let stride = size_of::<CellInstance>();
+
+        // Fast path: first frame or length changed drastically — full upload.
+        if self.prev_instances.len() != new.len() {
+            if !new.is_empty() {
+                self.queue
+                    .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(new));
+            }
+            self.prev_instances.clear();
+            self.prev_instances.extend_from_slice(new);
             return;
         }
 
-        let aw = self.glyph_cache.atlas_width;
-        let offset = (y_min * aw) as usize;
-        let size = ((y_max - y_min) * aw) as usize;
+        // Byte-wise compare to find the minimal dirty window.
+        let new_bytes: &[u8] = bytemuck::cast_slice(new);
+        let prev_bytes: &[u8] = bytemuck::cast_slice(&self.prev_instances);
+        let mut first = 0usize;
+        while first < new.len()
+            && new_bytes[first * stride..(first + 1) * stride]
+                == prev_bytes[first * stride..(first + 1) * stride]
+        {
+            first += 1;
+        }
+        if first == new.len() {
+            // Nothing changed — skip the upload entirely.
+            return;
+        }
+        let mut last = new.len();
+        while last > first
+            && new_bytes[(last - 1) * stride..last * stride]
+                == prev_bytes[(last - 1) * stride..last * stride]
+        {
+            last -= 1;
+        }
 
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: y_min, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &self.glyph_cache.atlas_data[offset..offset + size],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(aw),
-                rows_per_image: Some(y_max - y_min),
-            },
-            wgpu::Extent3d {
-                width: aw,
-                height: y_max - y_min,
-                depth_or_array_layers: 1,
-            },
+        let offset = (first * stride) as u64;
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            offset,
+            bytemuck::cast_slice(&new[first..last]),
         );
 
-        // Reset dirty region for next frame (no bind group recreation needed —
-        // we wrote to the same texture object).
-        self.glyph_cache.atlas_dirty_y_min = u32::MAX;
-        self.glyph_cache.atlas_dirty_y_max = 0;
+        // Refresh only the changed rows of the CPU snapshot.
+        self.prev_instances[first..last].copy_from_slice(&new[first..last]);
     }
 }
 

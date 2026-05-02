@@ -16,8 +16,19 @@ members = [
     "crates/nexterm-theme",
     "crates/nexterm-sync",
     "crates/nexterm-agent",
+    "crates/nexterm-docker",
+    "crates/portable-pty-sideload",
     "app",
 ]
+
+# Swap the published `portable-pty-psmux 0.9.3` for our vendored copy
+# under `crates/portable-pty-sideload/`.  The only functional delta is
+# `load_conpty()`: try `$NEXTERM_CONPTY_DLL` → `<exe>/conpty.dll` →
+# `kernel32.dll`, so a bundled Microsoft `conpty.dll` takes precedence
+# over the system ConPTY on Windows 11 builds (e.g. 26200) where the
+# system one rejects `CreateProcessW` on passthrough HPCONs.
+[patch.crates-io]
+portable-pty-psmux = { path = "crates/portable-pty-sideload" }
 
 [workspace.package]
 version = "0.1.0"
@@ -56,6 +67,7 @@ jiff = { version = "0.2", features = ["serde"] }
 # === Logging & Tracing ===
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+parking_lot = "0.12"
 
 # === OpenTelemetry (needed by agent_engine) ===
 opentelemetry = "0.29"
@@ -77,6 +89,7 @@ raw-window-handle = "0.6"
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = "0.31"
+egui_commonmark = "0.20"
 
 # === Text & Font ===
 cosmic-text = "0.12"
@@ -87,7 +100,32 @@ vte = "0.13"
 unicode-width = "0.2"
 
 # === PTY ===
-portable-pty = "0.8"
+# `portable-pty-psmux` is a drop-in fork of wezterm's `portable-pty 0.9`
+# (the upstream crate is not maintained as a standalone repo) with three
+# Windows-only patches that we want:
+#
+#   * PSEUDOCONSOLE_PASSTHROUGH_MODE — Windows 11 22H2+ (build 22621+).
+#     Tells ConPTY to relay VT sequences from the child straight through
+#     the read pipe instead of re-parsing them into Win32 console calls
+#     and re-emitting them.  Removes the multi-thousand-X amplification
+#     observed in vtebench `scrolling_*_small_region` benchmarks.
+#   * PSEUDOCONSOLE_WIN32_INPUT_MODE — proper Win32 input encoding so
+#     console apps see modifier keys etc.
+#   * PSEUDOCONSOLE_RESIZE_QUIRK — fixes content artifacts on resize.
+#
+# Plus 64 KiB pipe buffers (matching Windows Terminal) instead of the
+# 4 KiB default, which reduces kernel round-trips on bulk output.
+#
+# Older Windows builds and the Unix backends are unaffected: the fork
+# detects the build via `RtlGetVersion` and falls back to base flags,
+# and on Unix the patch is a no-op.  Set `PSMUX_NO_PASSTHROUGH=1` at
+# runtime to force-disable passthrough if a specific Windows build
+# misbehaves (the fork already retries without passthrough when
+# `CreateProcessW` fails with ERROR_INVALID_PARAMETER).
+#
+# We keep the dependency name `portable-pty` via `package = ...` so all
+# `use portable_pty::*` imports keep working unchanged.
+portable-pty = { package = "portable-pty-psmux", version = "0.9.3" }
 
 # === SSH / SFTP ===
 russh = "0.46"
@@ -149,3 +187,4 @@ nexterm-history = { path = "crates/nexterm-history" }
 nexterm-theme = { path = "crates/nexterm-theme" }
 nexterm-sync = { path = "crates/nexterm-sync" }
 nexterm-agent = { path = "crates/nexterm-agent" }
+nexterm-docker = { path = "crates/nexterm-docker" }

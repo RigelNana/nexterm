@@ -10,10 +10,10 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use agent_context::engine::CompressionBudget;
 use agent_core::agent::{Agent, AgentConfig};
 use agent_core::event::AgentEvent;
 use agent_core::message::DefaultMessageConverter;
-use agent_context::engine::CompressionBudget;
 use agent_permission::AllowAllPermissionGate;
 use agent_permission::gate::PermissionContext;
 use agent_provider::model::Model;
@@ -33,7 +33,10 @@ pub enum AgentBridgeEvent {
     /// Agent produced a text response (streaming delta).
     TextDelta(String),
     /// Agent is invoking a tool.
-    ToolCallStart { tool_name: String, args_summary: String },
+    ToolCallStart {
+        tool_name: String,
+        args_summary: String,
+    },
     /// Tool call completed.
     ToolCallEnd { tool_name: String, is_error: bool },
     /// Agent thinking text (for models that expose chain-of-thought).
@@ -169,7 +172,12 @@ impl AgentBridgeWorker {
 
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
-                AgentBridgeCommand::Configure { provider_type, base_url, api_key, model_id } => {
+                AgentBridgeCommand::Configure {
+                    provider_type,
+                    base_url,
+                    api_key,
+                    model_id,
+                } => {
                     self.config.provider_type = provider_type;
                     self.config.base_url = base_url;
                     self.config.api_key = api_key;
@@ -188,7 +196,10 @@ impl AgentBridgeWorker {
                     self.cancel = CancellationToken::new();
                     tracing::info!("agent run cancelled");
                 }
-                AgentBridgeCommand::Query { message, terminal_context } => {
+                AgentBridgeCommand::Query {
+                    message,
+                    terminal_context,
+                } => {
                     if self.config.api_key.is_empty() {
                         let _ = self.event_tx.send(AgentBridgeEvent::Error(
                             "No API key configured. Go to Settings → Agent to set your API key.".into()
@@ -201,9 +212,12 @@ impl AgentBridgeWorker {
                         match self.create_agent() {
                             Ok(a) => agent = Some(a),
                             Err(e) => {
-                                let _ = self.event_tx.send(AgentBridgeEvent::Error(
-                                    format!("Failed to create agent: {e}")
-                                )).await;
+                                let _ = self
+                                    .event_tx
+                                    .send(AgentBridgeEvent::Error(format!(
+                                        "Failed to create agent: {e}"
+                                    )))
+                                    .await;
                                 continue;
                             }
                         }
@@ -213,58 +227,70 @@ impl AgentBridgeWorker {
 
                     // Build the full prompt with optional terminal context
                     let full_prompt = if let Some(ctx) = terminal_context {
-                        format!(
-                            "{message}\n\n<terminal_context>\n{ctx}\n</terminal_context>"
-                        )
+                        format!("{message}\n\n<terminal_context>\n{ctx}\n</terminal_context>")
                     } else {
                         message
                     };
 
                     let event_tx = self.event_tx.clone();
-                    let result = a.query(&full_prompt, &self.cancel, move |event| {
-                        let tx = event_tx.clone();
-                        match &event {
-                            AgentEvent::MessageUpdate { event: provider_event, .. } => {
-                                use agent_provider::AssistantMessageEvent;
-                                match provider_event {
-                                    AssistantMessageEvent::TextDelta { delta, .. } => {
-                                        let _ = tx.try_send(AgentBridgeEvent::TextDelta(delta.clone()));
+                    let result = a
+                        .query(&full_prompt, &self.cancel, move |event| {
+                            let tx = event_tx.clone();
+                            match &event {
+                                AgentEvent::MessageUpdate {
+                                    event: provider_event,
+                                    ..
+                                } => {
+                                    use agent_provider::AssistantMessageEvent;
+                                    match provider_event {
+                                        AssistantMessageEvent::TextDelta { delta, .. } => {
+                                            let _ = tx.try_send(AgentBridgeEvent::TextDelta(
+                                                delta.clone(),
+                                            ));
+                                        }
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
+                                AgentEvent::ToolExecutionStart {
+                                    tool_name, args, ..
+                                } => {
+                                    let summary = serde_json::to_string(args)
+                                        .unwrap_or_default()
+                                        .chars()
+                                        .take(120)
+                                        .collect::<String>();
+                                    let _ = tx.try_send(AgentBridgeEvent::ToolCallStart {
+                                        tool_name: tool_name.clone(),
+                                        args_summary: summary,
+                                    });
+                                }
+                                AgentEvent::ToolExecutionEnd {
+                                    tool_name,
+                                    is_error,
+                                    ..
+                                } => {
+                                    let _ = tx.try_send(AgentBridgeEvent::ToolCallEnd {
+                                        tool_name: tool_name.clone(),
+                                        is_error: *is_error,
+                                    });
+                                }
+                                AgentEvent::Error { error } => {
+                                    let _ = tx.try_send(AgentBridgeEvent::Error(error.clone()));
+                                }
+                                _ => {}
                             }
-                            AgentEvent::ToolExecutionStart { tool_name, args, .. } => {
-                                let summary = serde_json::to_string(args)
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(120)
-                                    .collect::<String>();
-                                let _ = tx.try_send(AgentBridgeEvent::ToolCallStart {
-                                    tool_name: tool_name.clone(),
-                                    args_summary: summary,
-                                });
-                            }
-                            AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
-                                let _ = tx.try_send(AgentBridgeEvent::ToolCallEnd {
-                                    tool_name: tool_name.clone(),
-                                    is_error: *is_error,
-                                });
-                            }
-                            AgentEvent::Error { error } => {
-                                let _ = tx.try_send(AgentBridgeEvent::Error(error.clone()));
-                            }
-                            _ => {}
-                        }
-                    }).await;
+                        })
+                        .await;
 
                     match result {
                         Ok(_) => {
                             let _ = self.event_tx.send(AgentBridgeEvent::Done).await;
                         }
                         Err(e) => {
-                            let _ = self.event_tx.send(AgentBridgeEvent::Error(
-                                format!("{e}")
-                            )).await;
+                            let _ = self
+                                .event_tx
+                                .send(AgentBridgeEvent::Error(format!("{e}")))
+                                .await;
                         }
                     }
                 }

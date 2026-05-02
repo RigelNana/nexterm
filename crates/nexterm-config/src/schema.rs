@@ -55,9 +55,15 @@ pub struct SshProfileConfig {
     pub key_passphrase: Option<String>,
 }
 
-fn default_ssh_port() -> u16 { 22 }
-fn default_ssh_user() -> String { "root".into() }
-fn default_ssh_auth() -> String { "agent".into() }
+fn default_ssh_port() -> u16 {
+    22
+}
+fn default_ssh_user() -> String {
+    "root".into()
+}
+fn default_ssh_auth() -> String {
+    "agent".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

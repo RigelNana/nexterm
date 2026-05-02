@@ -1,0 +1,119 @@
+# Vendored copy of `portable-pty-psmux 0.9.3`
+# (https://crates.io/crates/portable-pty-psmux) with one local patch:
+#
+#   src/win/psuedocon.rs::load_conpty() now sideloads `conpty.dll` from
+#   the application directory before falling back to `kernel32.dll`.
+#
+# Reason: the stock fork hardcodes `kernel32.dll`, which disables
+# PSEUDOCONSOLE_PASSTHROUGH_MODE on Windows 11 Insider/Canary builds
+# (e.g. 26200) because their CreateProcessW rejects the passthrough
+# HPCON with ERROR_INVALID_PARAMETER.  Routing CreatePseudoConsole
+# through Microsoft's bundled `conpty.dll` (same approach as Alacritty
+# and Windows Terminal) gets us PASSTHROUGH_MODE even on those builds.
+#
+# The package name is kept as `portable-pty-psmux` so a single
+# `[patch.crates-io]` entry in the workspace root replaces the registry
+# crate everywhere without any other Cargo.toml changes.
+
+[package]
+edition = "2018"
+name = "portable-pty-psmux"
+version = "0.9.3"
+authors = ["Wez Furlong", "NexTerm contributors"]
+description = "Vendored portable-pty-psmux with local conpty.dll sideloading patch"
+documentation = "https://docs.rs/portable-pty"
+license = "MIT"
+repository = "https://github.com/psmux/portable-pty-patched"
+resolver = "2"
+publish = false
+
+[features]
+default = []
+serde_support = [
+    "serde",
+    "serde_derive",
+]
+
+[lib]
+name = "portable_pty"
+path = "src/lib.rs"
+
+[[example]]
+name = "bash"
+path = "examples/bash.rs"
+
+[[example]]
+name = "narrow"
+path = "examples/narrow.rs"
+
+[[example]]
+name = "whoami"
+path = "examples/whoami.rs"
+
+[[example]]
+name = "whoami_async"
+path = "examples/whoami_async.rs"
+
+[dependencies.anyhow]
+version = "1.0"
+
+[dependencies.downcast-rs]
+version = "2.0"
+
+[dependencies.filedescriptor]
+version = "0.8.3"
+
+[dependencies.libc]
+version = "0.2"
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.nix]
+version = "0.31"
+features = [
+    "term",
+    "fs",
+]
+
+[dependencies.serde]
+version = "1.0"
+optional = true
+
+[dependencies.serde_derive]
+version = "1.0"
+optional = true
+
+[dependencies.serial2]
+version = "0.2"
+
+[dependencies.shell-words]
+version = "1.1"
+
+[dev-dependencies.futures]
+version = "0.3"
+
+[dev-dependencies.smol]
+version = "2.0"
+
+[target."cfg(windows)".dependencies.lazy_static]
+version = "1.4"
+
+[target."cfg(windows)".dependencies.shared_library]
+version = "0.1"
+
+[target."cfg(windows)".dependencies.winapi]
+version = "0.3"
+features = [
+    "winuser",
+    "consoleapi",
+    "handleapi",
+    "fileapi",
+    "namedpipeapi",
+    "synchapi",
+    "libloaderapi",
+    "winnt",
+]
+
+[target."cfg(windows)".dependencies.winreg]
+version = "0.56"

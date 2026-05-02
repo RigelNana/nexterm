@@ -25,6 +25,7 @@ nexterm-config.workspace = true
 nexterm-history.workspace = true
 nexterm-theme.workspace = true
 nexterm-agent.workspace = true
+nexterm-docker.workspace = true
 
 # Runtime
 russh.workspace = true
@@ -39,6 +40,7 @@ uuid.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+parking_lot.workspace = true
 raw-window-handle.workspace = true
 dirs.workspace = true
 image.workspace = true

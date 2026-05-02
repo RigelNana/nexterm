@@ -163,6 +163,37 @@ pub enum GuiAction {
         api_key: String,
         model_id: String,
     },
+    // ─── Docker ───
+    /// Toggle the Docker container panel.
+    ToggleDockerPanel,
+    /// Re-fetch the container list. Honors `show_all` on `DockerPanelState`.
+    DockerRefresh,
+    /// Highlight a container for the detail pane (logs / inspect — future).
+    DockerSelect(String),
+    /// Start a stopped container.
+    DockerStart(String),
+    /// Stop a running container (Docker's default 10-second SIGTERM grace).
+    DockerStop(String),
+    /// `docker restart <id>`.
+    DockerRestart(String),
+    /// `docker rm [-f]` — the app layer passes `force=true` when the
+    /// container is still running.
+    DockerRemove {
+        id: String,
+        force: bool,
+    },
+    /// Begin streaming `docker logs --tail 500 -f <id>`. Cancels any
+    /// previously-active log stream.
+    DockerViewLogs(String),
+    /// Cancel the active `docker logs` stream and clear the log panel.
+    DockerStopLogs,
+    /// Open a new tab running `docker exec -it <id> <shell>`.
+    DockerExec {
+        id: String,
+        /// Default shell to invoke; the app falls back to `/bin/sh` when
+        /// empty. Most users just want an interactive shell.
+        shell: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +375,83 @@ pub struct AgentChatMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Docker panel state (GUI-side)
+// ---------------------------------------------------------------------------
+
+/// All panel-owned state for the Docker container list. The backend lives on
+/// the app layer; this struct only holds what the GUI draws each frame.
+#[derive(Debug, Clone, Default)]
+pub struct DockerPanelState {
+    /// Last refresh result. Populated by the app after a `DockerRefresh`
+    /// action completes; the GUI just renders what's here.
+    pub containers: Vec<nexterm_docker::ContainerInfo>,
+    /// Case-insensitive substring filter on name / image / id.
+    pub filter_query: String,
+    /// `docker ps` vs `docker ps -a`.
+    pub show_all: bool,
+    /// Currently selected row — used for the future logs/inspect detail view.
+    pub selected_id: Option<String>,
+    /// True while an async refresh is in flight.
+    pub loading: bool,
+    /// Top-of-panel red banner content, if any.
+    pub error: Option<String>,
+    /// `None` = not probed yet, `Some(false)` = docker unavailable on this
+    /// host (e.g. daemon not running, or binary missing).
+    pub docker_available: Option<bool>,
+
+    // ── Log viewer ──
+    /// `Some(id)` while a `docker logs -f <id>` stream is active. The app
+    /// layer pumps bytes into [`Self::log_lines`] until the stream is
+    /// cancelled or the container goes away.
+    pub log_streaming_id: Option<String>,
+    /// Best-effort display name for the streaming container (used in the
+    /// log panel header so we don't have to look it up every frame).
+    pub log_streaming_name: Option<String>,
+    /// Pre-rendered styled lines produced by feeding the raw log bytes
+    /// through a [`nexterm_vte::parser::TerminalParser`]. The app layer
+    /// rebuilds this on every chunk; the GUI only walks it for drawing.
+    pub log_lines: Vec<LogLine>,
+    /// True while the underlying stream is open. Goes to false on natural
+    /// EOF (container removed, daemon disconnect, etc.).
+    pub log_streaming: bool,
+    /// Auto-scroll to the bottom on new chunks.
+    pub log_auto_scroll: bool,
+}
+
+/// One visual line in the docker logs viewer, broken into styled runs.
+///
+/// Produced by [`snapshot_log_lines`] from a [`TerminalParser`]'s grid.
+/// Each [`LogSpan`] is a maximal run of consecutive cells with the same
+/// foreground/background/attributes.
+#[derive(Debug, Clone, Default)]
+pub struct LogLine {
+    pub spans: Vec<LogSpan>,
+}
+
+impl LogLine {
+    /// True for lines with no glyphs or only blank-space spans. The viewer
+    /// still allocates a row for these so vertical layout matches the source.
+    pub fn is_blank(&self) -> bool {
+        self.spans.is_empty() || self.spans.iter().all(|s| s.text.chars().all(|c| c == ' '))
+    }
+}
+
+/// One styled run within a [`LogLine`].
+#[derive(Debug, Clone, Default)]
+pub struct LogSpan {
+    pub text: String,
+    /// `None` means "use the panel default" — equivalent to VT [`Color::Default`].
+    pub fg: Option<egui::Color32>,
+    /// `None` means "transparent" — preserves the panel background.
+    pub bg: Option<egui::Color32>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+// ---------------------------------------------------------------------------
 // GUI state
 // ---------------------------------------------------------------------------
 
@@ -356,6 +464,14 @@ pub struct GuiState {
     pub show_find_bar: bool,
     pub show_system_panel: bool,
     pub show_sftp_panel: bool,
+    /// Terminal-only fullscreen: hides every egui panel (menu / toolbar /
+    /// tab bar / status bar / side panels) so the terminal takes the full
+    /// window area.  Orthogonal to OS-level fullscreen — the user can
+    /// combine the two for a completely chromeless display, or use this
+    /// alone while keeping the native title bar.  The background image
+    /// is still painted because it lives on a dedicated layer after the
+    /// panel loop.
+    pub terminal_fullscreen: bool,
     /// Ratio of SFTP left tree panel width (0.0..1.0).
     pub sftp_tree_ratio: f32,
     /// Editable SFTP path input.
@@ -452,6 +568,12 @@ pub struct GuiState {
     pub agent_base_url: String,
     pub agent_api_key: String,
     pub agent_model_id: String,
+    /// Cache used by `egui_commonmark` to render Markdown in the Agent panel.
+    pub agent_md_cache: egui_commonmark::CommonMarkCache,
+
+    // Docker panel
+    pub show_docker_panel: bool,
+    pub docker: DockerPanelState,
 }
 
 impl GuiState {
@@ -463,6 +585,7 @@ impl GuiState {
             show_about: false,
             show_find_bar: false,
             show_system_panel: false,
+            terminal_fullscreen: false,
             show_sftp_panel: false,
             sftp_tree_ratio: 0.20,
             sftp_path_input: String::new(),
@@ -531,6 +654,19 @@ impl GuiState {
             agent_base_url: "https://api.deepseek.com/v1".to_string(),
             agent_api_key: String::new(),
             agent_model_id: "deepseek-chat".to_string(),
+            agent_md_cache: egui_commonmark::CommonMarkCache::default(),
+
+            show_docker_panel: false,
+            docker: DockerPanelState {
+                // Default to showing stopped containers too — the user
+                // explicitly opened the panel, they likely want the full
+                // picture.
+                show_all: true,
+                // Auto-scroll on by default; user can pause it via the
+                // checkbox in the log viewer header.
+                log_auto_scroll: true,
+                ..DockerPanelState::default()
+            },
         }
     }
 
@@ -554,11 +690,8 @@ impl GuiState {
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 let pixels = rgba.into_raw();
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                let handle = ctx.load_texture(
-                    "bg_image",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
+                let handle =
+                    ctx.load_texture("bg_image", color_image, egui::TextureOptions::LINEAR);
                 self.bg_texture = Some(handle);
                 self.bg_loaded_path = path;
                 tracing::info!("loaded background image: {}", self.bg_loaded_path);
@@ -603,6 +736,28 @@ pub fn draw_gui(
         state.style_applied = true;
     }
 
+    // Terminal-only fullscreen: suppress every chrome / side panel so
+    // the terminal canvas takes the full window area.  We still let
+    // modal dialogs (settings / about / ssh) and the find bar draw so
+    // the user's escape hatches (Ctrl+Shift+F, Ctrl+, etc.) still work;
+    // everything that claims permanent screen real estate is skipped.
+    // The background-image painter at the end of the function runs
+    // either way, so the bg survives fullscreen.
+    if state.terminal_fullscreen {
+        if state.show_settings {
+            draw_settings_window(ctx, state, &mut actions);
+        }
+        if state.show_ssh_dialog {
+            draw_ssh_dialog(ctx, state, &mut actions);
+        }
+        if state.show_about {
+            draw_about_window(ctx, state);
+        }
+        if state.show_find_bar {
+            draw_find_bar(ctx, state, &mut actions);
+        }
+    } else {
+
     draw_menu_bar(ctx, state, &mut actions);
     draw_toolbar(ctx, state, &mut actions);
     draw_tab_bar(ctx, state, tabs, active_tab, &mut actions);
@@ -635,10 +790,19 @@ pub fn draw_gui(
         draw_agent_panel(ctx, state, &mut actions);
     }
 
+    // Docker panel (right sidebar). egui stacks multiple right SidePanels
+    // outward; drawing this after the agent panel keeps the order stable.
+    if state.show_docker_panel {
+        draw_docker_panel(ctx, state, &mut actions);
+    }
+
     // System status panel (right side, SSH only) — draw BEFORE SFTP so it claims
     // its width first and the SFTP bottom panel doesn't overlap it.
     if state.show_system_panel {
-        let active_ss = tabs.get(active_tab).and_then(|t| t.server_status.as_ref()).cloned();
+        let active_ss = tabs
+            .get(active_tab)
+            .and_then(|t| t.server_status.as_ref())
+            .cloned();
         if let Some(ss) = active_ss {
             draw_system_panel(ctx, state, &ss);
         }
@@ -650,6 +814,8 @@ pub fn draw_gui(
             draw_sftp_panel(ctx, state, snap, &mut actions);
         }
     }
+
+    } // end !terminal_fullscreen
 
     // Sync background image texture if path changed
     state.sync_background_image(ctx);
@@ -682,11 +848,7 @@ pub fn draw_gui(
         let alpha = ((1.0 - state.settings_opacity).clamp(0.0, 1.0) * 255.0) as u8;
         let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
         let mut mesh = egui::Mesh::with_texture(tex.id());
-        mesh.add_rect_with_uv(
-            full_rect,
-            egui::Rect::from_min_max(uv_min, uv_max),
-            tint,
-        );
+        mesh.add_rect_with_uv(full_rect, egui::Rect::from_min_max(uv_min, uv_max), tint);
         painter.add(egui::Shape::mesh(mesh));
     }
 
@@ -778,7 +940,11 @@ pub fn draw_scrollbar(
     ));
 
     // Track background
-    let track_alpha = if hovered || state.scrollbar_dragging { 60u8 } else { 30 };
+    let track_alpha = if hovered || state.scrollbar_dragging {
+        60u8
+    } else {
+        30
+    };
     painter.rect_filled(
         track_rect,
         rounding,
@@ -786,7 +952,11 @@ pub fn draw_scrollbar(
     );
 
     // Thumb
-    let thumb_alpha = if hovered || state.scrollbar_dragging || info.scroll_offset > 0 { 200u8 } else { 80 };
+    let thumb_alpha = if hovered || state.scrollbar_dragging || info.scroll_offset > 0 {
+        200u8
+    } else {
+        80
+    };
     painter.rect_filled(
         thumb_rect,
         rounding,
@@ -960,30 +1130,27 @@ fn draw_toolbar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gui
                 ui.spacing_mut().item_spacing.x = 2.0;
 
                 // ---- New tab (with dropdown for detected shells) ----
-                ui.menu_button(
-                    egui::RichText::new("+ 新建").size(12.0),
-                    |ui| {
-                        if state.available_shells.is_empty() {
-                            if ui.button("  本地终端   Ctrl+Shift+T").clicked() {
-                                actions.push(GuiAction::NewTab);
-                                ui.close_menu();
-                            }
-                        } else {
-                            for sh in &state.available_shells {
-                                let label = format!("  {}  ({})", sh.name, sh.path);
-                                if ui.button(&label).clicked() {
-                                    actions.push(GuiAction::NewTabWithShell(sh.path.clone()));
-                                    ui.close_menu();
-                                }
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("  SSH 连接...").clicked() {
-                            state.show_ssh_dialog = true;
+                ui.menu_button(egui::RichText::new("+ 新建").size(12.0), |ui| {
+                    if state.available_shells.is_empty() {
+                        if ui.button("  本地终端   Ctrl+Shift+T").clicked() {
+                            actions.push(GuiAction::NewTab);
                             ui.close_menu();
                         }
-                    },
-                );
+                    } else {
+                        for sh in &state.available_shells {
+                            let label = format!("  {}  ({})", sh.name, sh.path);
+                            if ui.button(&label).clicked() {
+                                actions.push(GuiAction::NewTabWithShell(sh.path.clone()));
+                                ui.close_menu();
+                            }
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("  SSH 连接...").clicked() {
+                        state.show_ssh_dialog = true;
+                        ui.close_menu();
+                    }
+                });
 
                 ui.add_space(4.0);
                 ui.separator();
@@ -1028,15 +1195,35 @@ fn draw_toolbar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gui
                     if toolbar_icon_btn(ui, agent_label, "AI Agent 面板") {
                         actions.push(GuiAction::ToggleAgentPanel);
                     }
-                    let hist_label = if state.show_history_panel { "HIST*" } else { "HIST" };
+                    let docker_label = if state.show_docker_panel {
+                        "DKR*"
+                    } else {
+                        "DKR"
+                    };
+                    if toolbar_icon_btn(ui, docker_label, "Docker 容器面板") {
+                        actions.push(GuiAction::ToggleDockerPanel);
+                    }
+                    let hist_label = if state.show_history_panel {
+                        "HIST*"
+                    } else {
+                        "HIST"
+                    };
                     if toolbar_icon_btn(ui, hist_label, "命令历史  Ctrl+R") {
                         actions.push(GuiAction::ToggleHistoryPanel);
                     }
-                    let sftp_label = if state.show_sftp_panel { "SFTP*" } else { "SFTP" };
+                    let sftp_label = if state.show_sftp_panel {
+                        "SFTP*"
+                    } else {
+                        "SFTP"
+                    };
                     if toolbar_icon_btn(ui, sftp_label, "切换 SFTP 文件浏览器") {
                         state.show_sftp_panel = !state.show_sftp_panel;
                     }
-                    let sys_label = if state.show_system_panel { "SYS*" } else { "SYS" };
+                    let sys_label = if state.show_system_panel {
+                        "SYS*"
+                    } else {
+                        "SYS"
+                    };
                     if toolbar_icon_btn(ui, sys_label, "切换系统状态面板") {
                         state.show_system_panel = !state.show_system_panel;
                     }
@@ -1078,32 +1265,39 @@ fn draw_tab_bar(
                 let frame = egui::Frame::new()
                     .fill(bg)
                     .inner_margin(egui::Margin::symmetric(10, 4))
-                    .corner_radius(egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 });
+                    .corner_radius(egui::CornerRadius {
+                        nw: 4,
+                        ne: 4,
+                        sw: 0,
+                        se: 0,
+                    });
 
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         // Status dot
                         let dot_color = if tab.is_ssh {
                             if tab.is_connected {
-                                egui::Color32::from_rgb(22, 160, 70)   // green
+                                egui::Color32::from_rgb(22, 160, 70) // green
                             } else {
-                                egui::Color32::from_rgb(210, 50, 45)   // red
+                                egui::Color32::from_rgb(210, 50, 45) // red
                             }
                         } else {
                             egui::Color32::from_rgb(0, 120, 212) // blue (local)
                         };
-                        let (dot_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(8.0, 8.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().circle_filled(dot_rect.center(), 3.5, dot_color);
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter()
+                            .circle_filled(dot_rect.center(), 3.5, dot_color);
 
                         ui.add_space(4.0);
 
                         // Title
                         let tab_fg = egui::Color32::from_rgb(30, 30, 30);
                         let text = if is_active {
-                            egui::RichText::new(&tab.title).strong().size(12.0).color(tab_fg)
+                            egui::RichText::new(&tab.title)
+                                .strong()
+                                .size(12.0)
+                                .color(tab_fg)
                         } else {
                             egui::RichText::new(&tab.title).size(12.0).color(tab_fg)
                         };
@@ -1131,7 +1325,11 @@ fn draw_tab_bar(
 
             // New tab button
             let plus = egui::RichText::new("+").size(16.0).strong();
-            if ui.add(egui::Button::new(plus).frame(false)).on_hover_text("新建标签页").clicked() {
+            if ui
+                .add(egui::Button::new(plus).frame(false))
+                .on_hover_text("新建标签页")
+                .clicked()
+            {
                 actions.push(GuiAction::NewTab);
             }
         });
@@ -1214,13 +1412,15 @@ fn draw_status_bar(
                                     .small()
                                     .color(egui::Color32::from_rgb(146, 131, 116)),
                             );
-                            load_resp.on_hover_text(format!("Load Average (1/5/15): {}", ss.load_avg));
+                            load_resp
+                                .on_hover_text(format!("Load Average (1/5/15): {}", ss.load_avg));
                         }
                         if ss.mem_total_mb > 0 {
                             ui.separator();
-                            let pct = (ss.mem_used_mb as f64 / ss.mem_total_mb as f64 * 100.0) as u32;
+                            let pct =
+                                (ss.mem_used_mb as f64 / ss.mem_total_mb as f64 * 100.0) as u32;
                             let mem_color = if pct > 90 {
-                                egui::Color32::from_rgb(204, 36, 29)  // red
+                                egui::Color32::from_rgb(204, 36, 29) // red
                             } else if pct > 70 {
                                 egui::Color32::from_rgb(250, 189, 47) // yellow
                             } else {
@@ -1277,12 +1477,7 @@ fn draw_status_bar(
                     // Current local time (platform-native)
                     let now = {
                         let zdt = jiff::Zoned::now();
-                        format!(
-                            "{:02}:{:02}:{:02}",
-                            zdt.hour(),
-                            zdt.minute(),
-                            zdt.second(),
-                        )
+                        format!("{:02}:{:02}:{:02}", zdt.hour(), zdt.minute(), zdt.second(),)
                     };
                     ui.label(
                         egui::RichText::new(&now)
@@ -1310,16 +1505,18 @@ fn draw_status_bar(
 /// Assign a deterministic color to a group name for the left-bar indicator.
 fn group_color(name: &str) -> egui::Color32 {
     const PALETTE: &[[u8; 3]] = &[
-        [69, 133, 136],   // aqua
-        [177, 98, 134],   // purple
-        [214, 93, 14],    // orange
-        [104, 157, 106],  // green
-        [211, 134, 155],  // pink
-        [152, 151, 26],   // yellow-green
-        [204, 36, 29],    // red
-        [69, 133, 136],   // teal
+        [69, 133, 136],  // aqua
+        [177, 98, 134],  // purple
+        [214, 93, 14],   // orange
+        [104, 157, 106], // green
+        [211, 134, 155], // pink
+        [152, 151, 26],  // yellow-green
+        [204, 36, 29],   // red
+        [69, 133, 136],  // teal
     ];
-    let h: u32 = name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let h: u32 = name
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     let c = PALETTE[(h as usize) % PALETTE.len()];
     egui::Color32::from_rgb(c[0], c[1], c[2])
 }
@@ -1347,17 +1544,16 @@ fn draw_session_panel(
             // ══════════════════════════════════════════════
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Sessions").size(14.0).strong().color(accent));
+                ui.label(
+                    egui::RichText::new("Sessions")
+                        .size(14.0)
+                        .strong()
+                        .color(accent),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let add_btn = egui::Button::new(
-                        egui::RichText::new("+").size(16.0).strong(),
-                    )
-                    .min_size(egui::vec2(22.0, 22.0));
-                    if ui
-                        .add(add_btn)
-                        .on_hover_text("New SSH session")
-                        .clicked()
-                    {
+                    let add_btn = egui::Button::new(egui::RichText::new("+").size(16.0).strong())
+                        .min_size(egui::vec2(22.0, 22.0));
+                    if ui.add(add_btn).on_hover_text("New SSH session").clicked() {
                         state.ssh_editing_profile_id = None;
                         state.ssh_name.clear();
                         state.ssh_host.clear();
@@ -1369,10 +1565,8 @@ fn draw_session_panel(
                         state.ssh_group = "Default".to_string();
                         state.show_ssh_dialog = true;
                     }
-                    let import_btn = egui::Button::new(
-                        egui::RichText::new("↓").size(14.0),
-                    )
-                    .min_size(egui::vec2(22.0, 22.0));
+                    let import_btn = egui::Button::new(egui::RichText::new("↓").size(14.0))
+                        .min_size(egui::vec2(22.0, 22.0));
                     if ui
                         .add(import_btn)
                         .on_hover_text("Import from ~/.ssh/config")
@@ -1418,11 +1612,7 @@ fn draw_session_panel(
                             .small()
                             .color(if visible_count > 0 { accent } else { dot_red }),
                     );
-                    if ui
-                        .small_button("x")
-                        .on_hover_text("清除过滤")
-                        .clicked()
-                    {
+                    if ui.small_button("x").on_hover_text("清除过滤").clicked() {
                         state.session_filter.clear();
                     }
                 });
@@ -1479,17 +1669,11 @@ fn draw_session_panel(
                         }
                         for (i, tab) in tabs.iter().enumerate() {
                             // Filter active sessions too
-                            if has_filter
-                                && !tab.title.to_lowercase().contains(&filter_lower)
-                            {
+                            if has_filter && !tab.title.to_lowercase().contains(&filter_lower) {
                                 continue;
                             }
                             let dot_color = if tab.is_ssh {
-                                if tab.is_connected {
-                                    dot_green
-                                } else {
-                                    dot_red
-                                }
+                                if tab.is_connected { dot_green } else { dot_red }
                             } else {
                                 blue
                             };
@@ -1497,15 +1681,13 @@ fn draw_session_panel(
 
                             ui.horizontal(|ui| {
                                 // Colored status dot
-                                let (rect, _) =
-                                    ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                ui.painter()
-                                    .circle_filled(rect.center(), 3.5, dot_color);
-
-                                let label_text = format!(
-                                    " {}  ({})",
-                                    tab.title, type_label,
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
                                 );
+                                ui.painter().circle_filled(rect.center(), 3.5, dot_color);
+
+                                let label_text = format!(" {}  ({})", tab.title, type_label,);
                                 let resp = ui.selectable_label(
                                     tab.is_active,
                                     egui::RichText::new(label_text).size(11.5),
@@ -1515,9 +1697,7 @@ fn draw_session_panel(
                                 }
                                 resp.on_hover_ui(|ui| {
                                     ui.label(
-                                        egui::RichText::new(&tab.title)
-                                            .strong()
-                                            .color(accent),
+                                        egui::RichText::new(&tab.title).strong().color(accent),
                                     );
                                     ui.label(format!(
                                         "{}  |  {}x{}",
@@ -1543,16 +1723,10 @@ fn draw_session_panel(
 
                     local_header.show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        if ui
-                            .selectable_label(false, "   >  新建终端")
-                            .clicked()
-                        {
+                        if ui.selectable_label(false, "   >  新建终端").clicked() {
                             actions.push(GuiAction::NewTab);
                         }
-                        if ui
-                            .selectable_label(false, "   >  新建 WSL 终端")
-                            .clicked()
-                        {
+                        if ui.selectable_label(false, "   >  新建 WSL 终端").clicked() {
                             actions.push(GuiAction::NewWslTab);
                         }
                     });
@@ -1565,11 +1739,7 @@ fn draw_session_panel(
                     if groups.is_empty() && state.ssh_profiles.is_empty() {
                         ui.add_space(8.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new("暂无保存的会话")
-                                    .color(gray)
-                                    .italics(),
-                            );
+                            ui.label(egui::RichText::new("暂无保存的会话").color(gray).italics());
                             ui.add_space(4.0);
                             if ui.link("+ 添加 SSH 会话").clicked() {
                                 state.show_ssh_dialog = true;
@@ -1582,139 +1752,148 @@ fn draw_session_panel(
 
                         // Group collapsing header with colored bar — profiles INSIDE
                         let id = ui.make_persistent_id(format!("ssh_grp_{}", group_name));
-                        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
-                            .show_header(ui, |ui| {
-                                // Left color bar
-                                let (bar_rect, _) =
-                                    ui.allocate_exact_size(egui::vec2(3.0, 16.0), egui::Sense::hover());
-                                ui.painter().rect_filled(bar_rect, 1.0, gc);
-                                ui.add_space(2.0);
-                                ui.label(
-                                    egui::RichText::new(format!("{}  ({})", group_name, profiles.len()))
-                                        .size(12.0)
-                                        .strong()
-                                        .color(gc),
-                                );
-                            })
-                            .body(|ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                let mut profile_action = None;
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            true,
+                        )
+                        .show_header(ui, |ui| {
+                            // Left color bar
+                            let (bar_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(3.0, 16.0), egui::Sense::hover());
+                            ui.painter().rect_filled(bar_rect, 1.0, gc);
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}  ({})",
+                                    group_name,
+                                    profiles.len()
+                                ))
+                                .size(12.0)
+                                .strong()
+                                .color(gc),
+                            );
+                        })
+                        .body(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let mut profile_action = None;
 
-                                for (idx, profile) in profiles {
-                                    let selected = state.selected_profile == Some(*idx);
+                            for (idx, profile) in profiles {
+                                let selected = state.selected_profile == Some(*idx);
 
-                                    let is_live = tabs.iter().any(|t| {
-                                        t.is_ssh
-                                            && t.title.contains(&profile.host)
-                                            && t.is_connected
-                                    });
+                                let is_live = tabs.iter().any(|t| {
+                                    t.is_ssh && t.title.contains(&profile.host) && t.is_connected
+                                });
 
-                                    // Auth label — plain ASCII
-                                    let auth_tag = match profile.auth_display.as_str() {
-                                        "Key" => "[K]",
-                                        "Agent" => "[A]",
-                                        "Keyboard" => "[I]",
-                                        _ => "[P]",
-                                    };
+                                // Auth label — plain ASCII
+                                let auth_tag = match profile.auth_display.as_str() {
+                                    "Key" => "[K]",
+                                    "Agent" => "[A]",
+                                    "Keyboard" => "[I]",
+                                    _ => "[P]",
+                                };
 
-                                    ui.horizontal(|ui| {
-                                        // Tiny colored bar
-                                        let (bar_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(2.0, 16.0),
+                                ui.horizontal(|ui| {
+                                    // Tiny colored bar
+                                    let (bar_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(2.0, 16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    if let Some(rgb) = profile.color_tag {
+                                        ui.painter().rect_filled(
+                                            bar_rect,
+                                            0.0,
+                                            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                                        );
+                                    } else {
+                                        ui.painter().rect_filled(
+                                            bar_rect,
+                                            0.0,
+                                            gc.linear_multiply(0.4),
+                                        );
+                                    }
+
+                                    // Live dot
+                                    if is_live {
+                                        let (dot_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(6.0, 6.0),
                                             egui::Sense::hover(),
                                         );
-                                        if let Some(rgb) = profile.color_tag {
-                                            ui.painter().rect_filled(
-                                                bar_rect,
-                                                0.0,
-                                                egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
-                                            );
-                                        } else {
-                                            ui.painter().rect_filled(bar_rect, 0.0, gc.linear_multiply(0.4));
-                                        }
+                                        ui.painter().circle_filled(
+                                            dot_rect.center(),
+                                            2.5,
+                                            dot_green,
+                                        );
+                                    } else {
+                                        ui.add_space(6.0);
+                                    }
 
-                                        // Live dot
+                                    let label = format!(" {} {}", auth_tag, profile.name,);
+                                    let resp = ui.selectable_label(
+                                        selected,
+                                        egui::RichText::new(&label).size(11.5),
+                                    );
+
+                                    resp.clone().on_hover_ui(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        ui.label(
+                                            egui::RichText::new(&profile.name)
+                                                .strong()
+                                                .color(accent),
+                                        );
+                                        ui.label(format!(
+                                            "{}@{}:{}",
+                                            profile.username, profile.host, profile.port
+                                        ));
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Auth: {} | Group: {}",
+                                                profile.auth_display, profile.group,
+                                            ))
+                                            .small()
+                                            .color(gray),
+                                        );
                                         if is_live {
-                                            let (dot_rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(6.0, 6.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter()
-                                                .circle_filled(dot_rect.center(), 2.5, dot_green);
-                                        } else {
-                                            ui.add_space(6.0);
-                                        }
-
-                                        let label = format!(
-                                            " {} {}",
-                                            auth_tag, profile.name,
-                                        );
-                                        let resp = ui.selectable_label(
-                                            selected,
-                                            egui::RichText::new(&label).size(11.5),
-                                        );
-
-                                        resp.clone().on_hover_ui(|ui| {
-                                            ui.spacing_mut().item_spacing.y = 2.0;
                                             ui.label(
-                                                egui::RichText::new(&profile.name)
-                                                    .strong()
-                                                    .color(accent),
+                                                egui::RichText::new("* Connected")
+                                                    .small()
+                                                    .color(dot_green),
                                             );
-                                            ui.label(format!(
-                                                "{}@{}:{}",
-                                                profile.username, profile.host, profile.port
-                                            ));
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Auth: {} | Group: {}",
-                                                    profile.auth_display, profile.group,
-                                                ))
-                                                .small()
-                                                .color(gray),
-                                            );
-                                            if is_live {
-                                                ui.label(
-                                                    egui::RichText::new("* Connected")
-                                                        .small()
-                                                        .color(dot_green),
-                                                );
-                                            }
-                                        });
-
-                                        if resp.clicked() {
-                                            state.selected_profile = Some(*idx);
                                         }
-                                        if resp.double_clicked() {
+                                    });
+
+                                    if resp.clicked() {
+                                        state.selected_profile = Some(*idx);
+                                    }
+                                    if resp.double_clicked() {
+                                        profile_action = Some(GuiAction::ConnectSavedProfile(*idx));
+                                    }
+
+                                    resp.context_menu(|ui| {
+                                        if ui.button(">  连接").clicked() {
                                             profile_action =
                                                 Some(GuiAction::ConnectSavedProfile(*idx));
+                                            ui.close_menu();
                                         }
-
-                                        resp.context_menu(|ui| {
-                                            if ui.button(">  连接").clicked() {
-                                                profile_action =
-                                                    Some(GuiAction::ConnectSavedProfile(*idx));
-                                                ui.close_menu();
-                                            }
-                                            if ui.button("~  编辑...").clicked() {
-                                                profile_action =
-                                                    Some(GuiAction::EditSavedProfile(*idx));
-                                                ui.close_menu();
-                                            }
-                                            ui.separator();
-                                            if ui.button("x  删除").clicked() {
-                                                profile_action =
-                                                    Some(GuiAction::DeleteSavedProfile(*idx));
-                                                ui.close_menu();
-                                            }
-                                        });
+                                        if ui.button("~  编辑...").clicked() {
+                                            profile_action =
+                                                Some(GuiAction::EditSavedProfile(*idx));
+                                            ui.close_menu();
+                                        }
+                                        ui.separator();
+                                        if ui.button("x  删除").clicked() {
+                                            profile_action =
+                                                Some(GuiAction::DeleteSavedProfile(*idx));
+                                            ui.close_menu();
+                                        }
                                     });
-                                }
+                                });
+                            }
 
-                                if let Some(a) = profile_action {
-                                    actions.push(a);
-                                }
-                            });
+                            if let Some(a) = profile_action {
+                                actions.push(a);
+                            }
+                        });
 
                         ui.add_space(2.0);
                     }
@@ -1757,7 +1936,12 @@ fn draw_history_panel(ctx: &egui::Context, state: &mut GuiState, actions: &mut V
             // Header
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("History").size(14.0).strong().color(accent));
+                ui.label(
+                    egui::RichText::new("History")
+                        .size(14.0)
+                        .strong()
+                        .color(accent),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("✕").on_hover_text("关闭").clicked() {
                         state.show_history_panel = false;
@@ -1812,11 +1996,10 @@ fn draw_history_panel(ctx: &egui::Context, state: &mut GuiState, actions: &mut V
 
                         let cmd_resp = ui.horizontal(|ui| {
                             // Exit status dot
-                            let (dot_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(8.0, 8.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().circle_filled(dot_rect.center(), 3.5, exit_color);
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter()
+                                .circle_filled(dot_rect.center(), 3.5, exit_color);
 
                             // Command text (truncated, clickable)
                             let avail = ui.available_width() - 45.0;
@@ -1838,11 +2021,12 @@ fn draw_history_panel(ctx: &egui::Context, state: &mut GuiState, actions: &mut V
                             resp.on_hover_text(&entry.command);
 
                             // Timestamp on the right
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    egui::RichText::new(&ts_str).size(10.0).color(gray),
-                                );
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(egui::RichText::new(&ts_str).size(10.0).color(gray));
+                                },
+                            );
                             clicked
                         });
                         if cmd_resp.inner {
@@ -1913,7 +2097,9 @@ fn draw_settings_appearance(ui: &mut egui::Ui, state: &mut GuiState) {
         .min_col_width(120.0)
         .show(ui, |ui| {
             ui.label("字体");
-            ui.add(egui::TextEdit::singleline(&mut state.settings_font_family).desired_width(200.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.settings_font_family).desired_width(200.0),
+            );
             ui.end_row();
 
             ui.label("字号");
@@ -1948,9 +2134,11 @@ fn draw_settings_appearance(ui: &mut egui::Ui, state: &mut GuiState) {
 
             ui.label("背景图片");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut state.settings_background_image)
-                    .desired_width(160.0)
-                    .hint_text("图片路径..."));
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.settings_background_image)
+                        .desired_width(160.0)
+                        .hint_text("图片路径..."),
+                );
                 if ui.button("浏览...").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("图片", &["png", "jpg", "jpeg", "bmp", "gif", "webp"])
@@ -2048,7 +2236,11 @@ fn draw_settings_keyboard(ui: &mut egui::Ui) {
 fn draw_ssh_dialog(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<GuiAction>) {
     let mut open = true;
     let is_editing = state.ssh_editing_profile_id.is_some();
-    let dialog_title = if is_editing { "Edit SSH Connection" } else { "New SSH Connection" };
+    let dialog_title = if is_editing {
+        "Edit SSH Connection"
+    } else {
+        "New SSH Connection"
+    };
     egui::Window::new(dialog_title)
         .open(&mut open)
         .default_width(440.0)
@@ -2092,10 +2284,7 @@ fn draw_ssh_dialog(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<
                     ui.end_row();
 
                     ui.label("Port");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.ssh_port)
-                            .desired_width(60.0),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut state.ssh_port).desired_width(60.0));
                     ui.end_row();
 
                     ui.label("Username");
@@ -2111,9 +2300,7 @@ fn draw_ssh_dialog(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<
 
                     if state.ssh_auth_mode == 0 {
                         ui.label("Password");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.ssh_password).password(true),
-                        );
+                        ui.add(egui::TextEdit::singleline(&mut state.ssh_password).password(true));
                     } else {
                         ui.label("Key Path");
                         ui.text_edit_singleline(&mut state.ssh_key_path);
@@ -2298,7 +2485,12 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
                 ui.spacing_mut().item_spacing.x = 4.0;
 
                 // ---- Search icon ----
-                ui.label(egui::RichText::new("Find:").size(12.0).strong().color(accent));
+                ui.label(
+                    egui::RichText::new("Find:")
+                        .size(12.0)
+                        .strong()
+                        .color(accent),
+                );
 
                 // ---- Search input ----
                 let resp = ui.add(
@@ -2323,7 +2515,8 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
                 }
 
                 // Enter = find next, Shift+Enter = find prev
-                let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let enter_pressed =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if enter_pressed {
                     let shift = ui.input(|i| i.modifiers.shift);
                     if shift {
@@ -2365,11 +2558,25 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
                 ui.add_space(2.0);
 
                 // ---- Toggle: Case Sensitive ----
-                let cs_color = if state.find_case_sensitive { accent } else { gray };
-                let cs_bg = if state.find_case_sensitive { active_bg } else { egui::Color32::TRANSPARENT };
+                let cs_color = if state.find_case_sensitive {
+                    accent
+                } else {
+                    gray
+                };
+                let cs_bg = if state.find_case_sensitive {
+                    active_bg
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
                 let cs_btn = egui::Button::new(
-                    egui::RichText::new("Aa").size(11.0).strong().color(cs_color)
-                ).fill(cs_bg).corner_radius(egui::CornerRadius::same(2)).min_size(egui::vec2(26.0, 20.0));
+                    egui::RichText::new("Aa")
+                        .size(11.0)
+                        .strong()
+                        .color(cs_color),
+                )
+                .fill(cs_bg)
+                .corner_radius(egui::CornerRadius::same(2))
+                .min_size(egui::vec2(26.0, 20.0));
                 if ui.add(cs_btn).on_hover_text("Match Case").clicked() {
                     state.find_case_sensitive = !state.find_case_sensitive;
                     state.find_last_query.clear(); // force re-search
@@ -2377,10 +2584,16 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
 
                 // ---- Toggle: Whole Word ----
                 let ww_color = if state.find_whole_word { accent } else { gray };
-                let ww_bg = if state.find_whole_word { active_bg } else { egui::Color32::TRANSPARENT };
-                let ww_btn = egui::Button::new(
-                    egui::RichText::new("W").size(11.0).strong().color(ww_color)
-                ).fill(ww_bg).corner_radius(egui::CornerRadius::same(2)).min_size(egui::vec2(26.0, 20.0));
+                let ww_bg = if state.find_whole_word {
+                    active_bg
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let ww_btn =
+                    egui::Button::new(egui::RichText::new("W").size(11.0).strong().color(ww_color))
+                        .fill(ww_bg)
+                        .corner_radius(egui::CornerRadius::same(2))
+                        .min_size(egui::vec2(26.0, 20.0));
                 if ui.add(ww_btn).on_hover_text("Whole Word").clicked() {
                     state.find_whole_word = !state.find_whole_word;
                     state.find_last_query.clear();
@@ -2388,10 +2601,20 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
 
                 // ---- Toggle: Regex ----
                 let rx_color = if state.find_use_regex { accent } else { gray };
-                let rx_bg = if state.find_use_regex { active_bg } else { egui::Color32::TRANSPARENT };
+                let rx_bg = if state.find_use_regex {
+                    active_bg
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
                 let rx_btn = egui::Button::new(
-                    egui::RichText::new(".*").size(11.0).strong().color(rx_color)
-                ).fill(rx_bg).corner_radius(egui::CornerRadius::same(2)).min_size(egui::vec2(26.0, 20.0));
+                    egui::RichText::new(".*")
+                        .size(11.0)
+                        .strong()
+                        .color(rx_color),
+                )
+                .fill(rx_bg)
+                .corner_radius(egui::CornerRadius::same(2))
+                .min_size(egui::vec2(26.0, 20.0));
                 if ui.add(rx_btn).on_hover_text("Use Regex").clicked() {
                     state.find_use_regex = !state.find_use_regex;
                     state.find_last_query.clear();
@@ -2424,9 +2647,15 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
 
                 // ---- Nav buttons ----
                 let nav_enabled = state.find_match_count > 0;
-                if ui.add_enabled(nav_enabled, egui::Button::new(
-                    egui::RichText::new("^").size(10.0)
-                ).min_size(egui::vec2(22.0, 20.0))).on_hover_text("Previous  Shift+Enter").clicked() {
+                if ui
+                    .add_enabled(
+                        nav_enabled,
+                        egui::Button::new(egui::RichText::new("^").size(10.0))
+                            .min_size(egui::vec2(22.0, 20.0)),
+                    )
+                    .on_hover_text("Previous  Shift+Enter")
+                    .clicked()
+                {
                     actions.push(GuiAction::FindPrev {
                         query: state.find_query.clone(),
                         case_sensitive: state.find_case_sensitive,
@@ -2434,9 +2663,15 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
                         use_regex: state.find_use_regex,
                     });
                 }
-                if ui.add_enabled(nav_enabled, egui::Button::new(
-                    egui::RichText::new("v").size(10.0)
-                ).min_size(egui::vec2(22.0, 20.0))).on_hover_text("Next  Enter").clicked() {
+                if ui
+                    .add_enabled(
+                        nav_enabled,
+                        egui::Button::new(egui::RichText::new("v").size(10.0))
+                            .min_size(egui::vec2(22.0, 20.0)),
+                    )
+                    .on_hover_text("Next  Enter")
+                    .clicked()
+                {
                     actions.push(GuiAction::FindNext {
                         query: state.find_query.clone(),
                         case_sensitive: state.find_case_sensitive,
@@ -2450,9 +2685,14 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
                 ui.add_space(2.0);
 
                 // ---- Find All ----
-                if ui.add_enabled(!state.find_query.is_empty(), egui::Button::new(
-                    egui::RichText::new("Find All").size(11.0)
-                ).min_size(egui::vec2(0.0, 20.0))).clicked() {
+                if ui
+                    .add_enabled(
+                        !state.find_query.is_empty(),
+                        egui::Button::new(egui::RichText::new("Find All").size(11.0))
+                            .min_size(egui::vec2(0.0, 20.0)),
+                    )
+                    .clicked()
+                {
                     actions.push(GuiAction::FindAll {
                         query: state.find_query.clone(),
                         case_sensitive: state.find_case_sensitive,
@@ -2463,9 +2703,14 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
 
                 // ---- Close button (right-aligned) ----
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("X").size(12.0).color(gray)
-                    ).frame(false)).on_hover_text("Close  Esc").clicked() {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("X").size(12.0).color(gray))
+                                .frame(false),
+                        )
+                        .on_hover_text("Close  Esc")
+                        .clicked()
+                    {
                         state.show_find_bar = false;
                         state.find_match_count = 0;
                         state.find_current_index = 0;
@@ -2481,13 +2726,19 @@ fn draw_find_bar(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<Gu
 // ---------------------------------------------------------------------------
 
 fn apply_theme(ctx: &egui::Context) {
-    use egui::{style::WidgetVisuals, Color32, CornerRadius, Stroke, Visuals};
+    use egui::{Color32, CornerRadius, Stroke, Visuals, style::WidgetVisuals};
 
     let mut visuals = Visuals::light();
     let bg = Color32::from_rgb(250, 250, 250);
     let bg1 = Color32::from_rgb(235, 235, 235);
     let bg2 = Color32::from_rgb(218, 218, 218);
-    let fg = Color32::from_rgb(40, 40, 40);
+    // Normal body text. Keep readable but slightly lighter than pure black so
+    // that `RichText::strong()` / markdown **bold** is visibly darker.
+    let fg = Color32::from_rgb(70, 70, 70);
+    // Strong/bold text color — egui reads this from
+    // `widgets.noninteractive.fg_stroke.color` via `Visuals::strong_text_color()`
+    // and it bypasses `override_text_color`. Keep it near-black for contrast.
+    let fg_strong = Color32::from_rgb(5, 10, 20);
     let accent = Color32::from_rgb(0, 120, 212);
     let gray = Color32::from_rgb(130, 130, 130);
     let cr = CornerRadius::same(4);
@@ -2505,7 +2756,9 @@ fn apply_theme(ctx: &egui::Context) {
         bg_fill: bg,
         weak_bg_fill: bg,
         bg_stroke: Stroke::new(0.5, bg2),
-        fg_stroke: Stroke::new(1.0, fg),
+        // fg_stroke.color doubles as `strong_text_color()` in egui — use the
+        // darker shade so bold markdown stands out from the regular body.
+        fg_stroke: Stroke::new(1.0, fg_strong),
         corner_radius: cr,
         expansion: 0.0,
     };
@@ -2580,9 +2833,15 @@ fn fmt_size(bytes: u64) -> String {
 pub fn fmt_perms(mode: u32) -> String {
     let mut s = String::with_capacity(9);
     let bits = [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
     ];
     for (bit, ch) in &bits {
         s.push(if mode & bit != 0 { *ch } else { '-' });
@@ -2608,19 +2867,48 @@ pub fn fmt_mtime(ts: u64) -> String {
     // Compute year/month/day from days since epoch (1970-01-01)
     let mut year = 1970u64;
     loop {
-        let ydays = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 366 } else { 365 };
-        if days < ydays { break; }
+        let ydays = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if days < ydays {
+            break;
+        }
         days -= ydays;
         year += 1;
     }
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let mdays = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 0usize;
     for (i, &md) in mdays.iter().enumerate() {
-        if days < md { month = i; break; }
+        if days < md {
+            month = i;
+            break;
+        }
         days -= md;
     }
-    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month + 1, days + 1, hour, min)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        year,
+        month + 1,
+        days + 1,
+        hour,
+        min
+    )
 }
 
 fn draw_sftp_panel(
@@ -2643,12 +2931,20 @@ fn draw_sftp_panel(
         .resizable(true)
         .default_height(300.0)
         .height_range(100.0..=600.0)
-        .frame(egui::Frame::new().fill(bg).inner_margin(egui::Margin::same(6)))
+        .frame(
+            egui::Frame::new()
+                .fill(bg)
+                .inner_margin(egui::Margin::same(6)),
+        )
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
 
             if !snap.initialized {
-                ui.label(egui::RichText::new("Connecting to SFTP...").size(fs).color(label_color));
+                ui.label(
+                    egui::RichText::new("Connecting to SFTP...")
+                        .size(fs)
+                        .color(label_color),
+                );
                 return;
             }
 
@@ -2659,12 +2955,25 @@ fn draw_sftp_panel(
 
             // ── Top bar: nav buttons + editable path + action buttons ──
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("SFTP").size(fs).strong().color(header_color));
+                ui.label(
+                    egui::RichText::new("SFTP")
+                        .size(fs)
+                        .strong()
+                        .color(header_color),
+                );
                 ui.separator();
-                if ui.button(egui::RichText::new("^").size(fs)).on_hover_text("Go up").clicked() {
+                if ui
+                    .button(egui::RichText::new("^").size(fs))
+                    .on_hover_text("Go up")
+                    .clicked()
+                {
                     actions.push(GuiAction::SftpGoUp);
                 }
-                if ui.button(egui::RichText::new("~").size(fs)).on_hover_text("Go home").clicked() {
+                if ui
+                    .button(egui::RichText::new("~").size(fs))
+                    .on_hover_text("Go home")
+                    .clicked()
+                {
                     actions.push(GuiAction::SftpGoHome);
                 }
                 ui.separator();
@@ -2673,7 +2982,7 @@ fn draw_sftp_panel(
                 let path_resp = ui.add(
                     egui::TextEdit::singleline(&mut state.sftp_path_input)
                         .desired_width(ui.available_width() - 220.0)
-                        .font(egui::TextStyle::Body)
+                        .font(egui::TextStyle::Body),
                 );
                 if path_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let target = state.sftp_path_input.trim().to_string();
@@ -2684,7 +2993,11 @@ fn draw_sftp_panel(
 
                 ui.separator();
                 // Action buttons
-                if ui.button(egui::RichText::new("+Dir").size(fs)).on_hover_text("New directory").clicked() {
+                if ui
+                    .button(egui::RichText::new("+Dir").size(fs))
+                    .on_hover_text("New directory")
+                    .clicked()
+                {
                     let name = state.sftp_new_name.trim().to_string();
                     if !name.is_empty() {
                         let full = format!("{}/{}", snap.current_path.trim_end_matches('/'), name);
@@ -2692,7 +3005,11 @@ fn draw_sftp_panel(
                         state.sftp_new_name.clear();
                     }
                 }
-                if ui.button(egui::RichText::new("+File").size(fs)).on_hover_text("New file").clicked() {
+                if ui
+                    .button(egui::RichText::new("+File").size(fs))
+                    .on_hover_text("New file")
+                    .clicked()
+                {
                     let name = state.sftp_new_name.trim().to_string();
                     if !name.is_empty() {
                         let full = format!("{}/{}", snap.current_path.trim_end_matches('/'), name);
@@ -2700,7 +3017,11 @@ fn draw_sftp_panel(
                         state.sftp_new_name.clear();
                     }
                 }
-                if ui.button(egui::RichText::new("Upload").size(fs)).on_hover_text("Upload file").clicked() {
+                if ui
+                    .button(egui::RichText::new("Upload").size(fs))
+                    .on_hover_text("Upload file")
+                    .clicked()
+                {
                     actions.push(GuiAction::SftpUpload);
                 }
             });
@@ -2711,19 +3032,28 @@ fn draw_sftp_panel(
                     egui::TextEdit::singleline(&mut state.sftp_new_name)
                         .desired_width(200.0)
                         .hint_text("new file or folder name")
-                        .font(egui::TextStyle::Body)
+                        .font(egui::TextStyle::Body),
                 );
             });
 
             if let Some(err) = &snap.error {
-                ui.label(egui::RichText::new(format!("Error: {err}")).size(fs).color(egui::Color32::from_rgb(204, 36, 29)));
+                ui.label(
+                    egui::RichText::new(format!("Error: {err}"))
+                        .size(fs)
+                        .color(egui::Color32::from_rgb(204, 36, 29)),
+                );
             }
 
             // ── Transfer progress section (active uploads/downloads) ──
             if !snap.transfers.is_empty() {
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Transfers").size(fs).strong().color(header_color));
+                    ui.label(
+                        egui::RichText::new("Transfers")
+                            .size(fs)
+                            .strong()
+                            .color(header_color),
+                    );
                     let active = snap.transfers.iter().filter(|t| !t.done).count();
                     let done = snap.transfers.iter().filter(|t| t.done).count();
                     ui.label(
@@ -2732,7 +3062,8 @@ fn draw_sftp_panel(
                             .color(label_color),
                     );
                     if done > 0
-                        && ui.small_button("Clear done")
+                        && ui
+                            .small_button("Clear done")
                             .on_hover_text("Remove completed transfers")
                             .clicked()
                     {
@@ -2744,10 +3075,7 @@ fn draw_sftp_panel(
                     .max_height(80.0)
                     .show(ui, |ui| {
                         for t in &snap.transfers {
-                            let name = t.remote_path
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(&t.remote_path);
+                            let name = t.remote_path.rsplit('/').next().unwrap_or(&t.remote_path);
                             let frac = if t.total > 0 {
                                 (t.bytes as f32 / t.total as f32).clamp(0.0, 1.0)
                             } else if t.done {
@@ -2755,7 +3083,11 @@ fn draw_sftp_panel(
                             } else {
                                 0.0
                             };
-                            let arrow = if t.direction == "Upload" { "↑" } else { "↓" };
+                            let arrow = if t.direction == "Upload" {
+                                "↑"
+                            } else {
+                                "↓"
+                            };
                             let status_color = if let Some(_) = &t.error {
                                 egui::Color32::from_rgb(204, 36, 29)
                             } else if t.done {
@@ -2773,7 +3105,11 @@ fn draw_sftp_panel(
                                     egui::RichText::new(format!(
                                         "{} / {}",
                                         fmt_size(t.bytes),
-                                        if t.total > 0 { fmt_size(t.total) } else { "?".into() },
+                                        if t.total > 0 {
+                                            fmt_size(t.total)
+                                        } else {
+                                            "?".into()
+                                        },
                                     ))
                                     .size(fs - 1.0)
                                     .color(label_color),
@@ -2807,7 +3143,12 @@ fn draw_sftp_panel(
                     egui::vec2(tree_w, avail.y),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.label(egui::RichText::new("Directories").size(fs).strong().color(header_color));
+                        ui.label(
+                            egui::RichText::new("Directories")
+                                .size(fs)
+                                .strong()
+                                .color(header_color),
+                        );
                         ui.add_space(2.0);
                         egui::ScrollArea::vertical()
                             .id_salt("sftp_tree_scroll")
@@ -2819,15 +3160,24 @@ fn draw_sftp_panel(
                                     .striped(true)
                                     .show(ui, |ui| {
                                         for entry in &snap.entries {
-                                            if !entry.is_dir { continue; }
-                                            let label = egui::RichText::new(format!("  {}", entry.name))
-                                                .size(fs)
-                                                .color(dir_color);
-                                            if ui.add(egui::Label::new(label).sense(egui::Sense::click()))
+                                            if !entry.is_dir {
+                                                continue;
+                                            }
+                                            let label =
+                                                egui::RichText::new(format!("  {}", entry.name))
+                                                    .size(fs)
+                                                    .color(dir_color);
+                                            if ui
+                                                .add(
+                                                    egui::Label::new(label)
+                                                        .sense(egui::Sense::click()),
+                                                )
                                                 .on_hover_text(&entry.path)
                                                 .clicked()
                                             {
-                                                actions.push(GuiAction::SftpNavigate(entry.path.clone()));
+                                                actions.push(GuiAction::SftpNavigate(
+                                                    entry.path.clone(),
+                                                ));
                                             }
                                             ui.end_row();
                                         }
@@ -2837,10 +3187,8 @@ fn draw_sftp_panel(
                 );
 
                 // ── Draggable splitter ──
-                let (splitter_rect, splitter_resp) = ui.allocate_exact_size(
-                    egui::vec2(splitter_w, avail.y),
-                    egui::Sense::drag(),
-                );
+                let (splitter_rect, splitter_resp) =
+                    ui.allocate_exact_size(egui::vec2(splitter_w, avail.y), egui::Sense::drag());
                 let splitter_color = if splitter_resp.hovered() || splitter_resp.dragged() {
                     header_color
                 } else {
@@ -2879,13 +3227,48 @@ fn draw_sftp_panel(
                                     .min_col_width(0.0)
                                     .show(ui, |ui| {
                                         // Header
-                                        ui.label(egui::RichText::new(" ").size(fs).strong().color(label_color));
-                                        ui.label(egui::RichText::new("Name").size(fs).strong().color(label_color));
-                                        ui.label(egui::RichText::new("Size").size(fs).strong().color(label_color));
-                                        ui.label(egui::RichText::new("Type").size(fs).strong().color(label_color));
-                                        ui.label(egui::RichText::new("Modified").size(fs).strong().color(label_color));
-                                        ui.label(egui::RichText::new("Perms").size(fs).strong().color(label_color));
-                                        ui.label(egui::RichText::new("Owner/Group").size(fs).strong().color(label_color));
+                                        ui.label(
+                                            egui::RichText::new(" ")
+                                                .size(fs)
+                                                .strong()
+                                                .color(label_color),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Name")
+                                                .size(fs)
+                                                .strong()
+                                                .color(label_color),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Size")
+                                                .size(fs)
+                                                .strong()
+                                                .color(label_color),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Type")
+                                                .size(fs)
+                                                .strong()
+                                                .color(label_color),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Modified")
+                                                .size(fs)
+                                                .strong()
+                                                .color(label_color),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Perms")
+                                                .size(fs)
+                                                .strong()
+                                                .color(label_color),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Owner/Group")
+                                                .size(fs)
+                                                .strong()
+                                                .color(label_color),
+                                        );
                                         ui.label(egui::RichText::new("").size(fs));
                                         ui.end_row();
 
@@ -2897,28 +3280,83 @@ fn draw_sftp_panel(
                                             } else {
                                                 file_color
                                             };
-                                            let icon = if entry.is_dir { "D" } else if entry.file_type == "link" { "L" } else { "-" };
+                                            let icon = if entry.is_dir {
+                                                "D"
+                                            } else if entry.file_type == "link" {
+                                                "L"
+                                            } else {
+                                                "-"
+                                            };
 
-                                            ui.label(egui::RichText::new(icon).size(fs).color(name_color));
+                                            ui.label(
+                                                egui::RichText::new(icon)
+                                                    .size(fs)
+                                                    .color(name_color),
+                                            );
                                             if entry.is_dir {
-                                                if ui.add(egui::Label::new(
-                                                    egui::RichText::new(&entry.name).size(fs).color(name_color),
-                                                ).sense(egui::Sense::click())).double_clicked() {
-                                                    actions.push(GuiAction::SftpNavigate(entry.path.clone()));
+                                                if ui
+                                                    .add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&entry.name)
+                                                                .size(fs)
+                                                                .color(name_color),
+                                                        )
+                                                        .sense(egui::Sense::click()),
+                                                    )
+                                                    .double_clicked()
+                                                {
+                                                    actions.push(GuiAction::SftpNavigate(
+                                                        entry.path.clone(),
+                                                    ));
                                                 }
                                             } else {
-                                                ui.label(egui::RichText::new(&entry.name).size(fs).color(name_color));
+                                                ui.label(
+                                                    egui::RichText::new(&entry.name)
+                                                        .size(fs)
+                                                        .color(name_color),
+                                                );
                                             }
-                                            let size_str = if entry.is_dir { "-".to_string() } else { fmt_size(entry.size) };
-                                            ui.label(egui::RichText::new(size_str).size(fs).color(label_color));
-                                            ui.label(egui::RichText::new(&entry.file_type).size(fs).color(label_color));
-                                            ui.label(egui::RichText::new(&entry.modified).size(fs).color(label_color));
-                                            ui.label(egui::RichText::new(&entry.permissions).size(fs).color(label_color).monospace());
-                                            ui.label(egui::RichText::new(&entry.group).size(fs).color(label_color));
+                                            let size_str = if entry.is_dir {
+                                                "-".to_string()
+                                            } else {
+                                                fmt_size(entry.size)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(size_str)
+                                                    .size(fs)
+                                                    .color(label_color),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&entry.file_type)
+                                                    .size(fs)
+                                                    .color(label_color),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&entry.modified)
+                                                    .size(fs)
+                                                    .color(label_color),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&entry.permissions)
+                                                    .size(fs)
+                                                    .color(label_color)
+                                                    .monospace(),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&entry.group)
+                                                    .size(fs)
+                                                    .color(label_color),
+                                            );
                                             // Download button for files
                                             if !entry.is_dir {
-                                                if ui.small_button("DL").on_hover_text("Download").clicked() {
-                                                    actions.push(GuiAction::SftpDownload(entry.path.clone()));
+                                                if ui
+                                                    .small_button("DL")
+                                                    .on_hover_text("Download")
+                                                    .clicked()
+                                                {
+                                                    actions.push(GuiAction::SftpDownload(
+                                                        entry.path.clone(),
+                                                    ));
                                                 }
                                             } else {
                                                 ui.label(egui::RichText::new("").size(fs));
@@ -2996,273 +3434,480 @@ fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatu
         .min_width(200.0)
         .max_width(500.0)
         .resizable(true)
-        .frame(egui::Frame::new().fill(bg).inner_margin(egui::Margin::same(8)))
+        .frame(
+            egui::Frame::new()
+                .fill(bg)
+                .inner_margin(egui::Margin::same(8)),
+        )
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
+                ui.spacing_mut().item_spacing.y = 4.0;
 
-            // ── Header ──
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("System Status").size(14.0).strong().color(header_color));
-                if !ss.hostname.is_empty() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(&ss.hostname).small().color(label_color));
-                    });
-                }
-            });
-            ui.separator();
-
-            // ── CPU & Memory ──
-            ui.label(egui::RichText::new("CPU / Memory").size(11.0).strong().color(value_color));
-            egui::Grid::new("cpu_mem_grid")
-                .num_columns(2)
-                .spacing([8.0, 2.0])
-                .show(ui, |ui| {
-                    let bar_w = 110.0;
-                    let bar_h = 12.0;
-
-                    // CPU
-                    ui.label(egui::RichText::new("CPU").small().color(label_color));
-                    let cpu_color = if ss.cpu_pct > 90.0 { red } else if ss.cpu_pct > 70.0 { yellow } else { green };
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, bar_h), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, bar_bg);
-                        let fill_w = bar_w * (ss.cpu_pct / 100.0).min(1.0);
-                        if fill_w > 0.0 {
-                            ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_h)), 2.0, cpu_color);
-                        }
-                        ui.label(egui::RichText::new(format!("{:.0}%", ss.cpu_pct)).small().color(cpu_color));
-                    });
-                    ui.end_row();
-
-                    // Memory
-                    ui.label(egui::RichText::new("Mem").small().color(label_color));
-                    let mem_pct = if ss.mem_total_mb > 0 { ss.mem_used_mb as f32 / ss.mem_total_mb as f32 * 100.0 } else { 0.0 };
-                    let mem_color = if mem_pct > 90.0 { red } else if mem_pct > 70.0 { yellow } else { green };
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, bar_h), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, bar_bg);
-                        let fill_w = bar_w * (mem_pct / 100.0).min(1.0);
-                        if fill_w > 0.0 {
-                            ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_h)), 2.0, mem_color);
-                        }
-                        ui.label(egui::RichText::new(format!("{}/{}", fmt_mem_mb(ss.mem_used_mb), fmt_mem_mb(ss.mem_total_mb))).small().color(mem_color));
-                    });
-                    ui.end_row();
-
-                    // Load
-                    if !ss.load_avg.is_empty() {
-                        ui.label(egui::RichText::new("Load").small().color(label_color));
-                        ui.label(egui::RichText::new(&ss.load_avg).small().color(value_color));
-                        ui.end_row();
-                    }
-                    // Uptime
-                    if !ss.uptime.is_empty() {
-                        ui.label(egui::RichText::new("Up").small().color(label_color));
-                        ui.label(egui::RichText::new(&ss.uptime).small().color(value_color));
-                        ui.end_row();
-                    }
-                    // Latency (true RTT via echo)
-                    ui.label(egui::RichText::new("RTT").small().color(label_color));
-                    let lat_color = if ss.latency_ms > 500 { red } else if ss.latency_ms > 200 { yellow } else { green };
-                    ui.label(egui::RichText::new(format!("{}ms", ss.latency_ms)).small().color(lat_color));
-                    ui.end_row();
-                });
-
-            ui.add_space(4.0);
-            ui.separator();
-
-            // ── Disks ──
-            if !ss.disks.is_empty() {
-                ui.label(egui::RichText::new("Disks").size(11.0).strong().color(value_color));
-                egui::Grid::new("disk_grid")
-                    .num_columns(4)
-                    .spacing([4.0, 1.0])
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Mount").small().strong().color(label_color));
-                        ui.label(egui::RichText::new("Type").small().strong().color(label_color));
-                        ui.label(egui::RichText::new("Used/Total").small().strong().color(label_color));
-                        ui.label(egui::RichText::new("Use%").small().strong().color(label_color));
-                        ui.end_row();
-
-                        for d in &ss.disks {
-                            ui.label(egui::RichText::new(&d.mount).small().color(value_color));
-                            ui.label(egui::RichText::new(&d.fstype).small().color(label_color));
-                            ui.label(egui::RichText::new(format!("{}/{}", fmt_disk_size(&d.used), fmt_disk_size(&d.total))).small().color(label_color));
-                            let pct_num: f32 = d.use_pct.trim_end_matches('%').parse().unwrap_or(0.0);
-                            let pct_color = if pct_num > 90.0 { red } else if pct_num > 70.0 { yellow } else { green };
-                            ui.label(egui::RichText::new(&d.use_pct).small().color(pct_color));
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(4.0);
-                ui.separator();
-            }
-
-            // ── Network ──
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Network").size(11.0).strong().color(value_color));
-
-                // Interface selector
-                if !ss.net_interfaces.is_empty() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let current_label = match state.selected_net_if {
-                            None => "All".to_string(),
-                            Some(idx) => ss.net_interfaces.get(idx)
-                                .map(|i| i.name.clone())
-                                .unwrap_or_else(|| "All".to_string()),
-                        };
-                        egui::ComboBox::from_id_salt("net_if_sel")
-                            .width(80.0)
-                            .selected_text(egui::RichText::new(&current_label).small())
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(state.selected_net_if.is_none(), "All").clicked() {
-                                    state.selected_net_if = None;
-                                }
-                                for (i, iface) in ss.net_interfaces.iter().enumerate() {
-                                    if ui.selectable_label(state.selected_net_if == Some(i), &iface.name).clicked() {
-                                        state.selected_net_if = Some(i);
-                                    }
-                                }
-                            });
-                    });
-                }
-            });
-
-            // Pick the history to display
-            let history: &[NetRateSnapshot] = match state.selected_net_if {
-                Some(idx) => ss.net_interfaces.get(idx)
-                    .map(|i| i.history.as_slice())
-                    .unwrap_or(&ss.net_history),
-                None => &ss.net_history,
-            };
-
-            if history.is_empty() {
-                ui.label(egui::RichText::new("Collecting...").small().color(label_color));
-            } else {
-                // Current rate
-                let last = history.last().unwrap();
+                // ── Header ──
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("RX: {}", fmt_rate(last.rx_bps))).small().color(cyan));
-                    ui.label(egui::RichText::new(format!("TX: {}", fmt_rate(last.tx_bps))).small().color(purple));
-                });
-
-                // Sparkline area chart
-                let graph_h = 60.0;
-                let avail_w = ui.available_width();
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(avail_w, graph_h), egui::Sense::hover());
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(240, 240, 240));
-
-                let n = history.len();
-                if n > 1 {
-                    let max_val = history.iter()
-                        .map(|s| s.rx_bps.max(s.tx_bps))
-                        .fold(1.0_f64, f64::max);
-                    let step = avail_w / (n.max(2) - 1) as f32;
-
-                    // Helper to draw an area + line
-                    let draw_series = |data: &[f64], color: egui::Color32, fill_alpha: u8| {
-                        let points: Vec<egui::Pos2> = data.iter().enumerate().map(|(i, &v)| {
-                            let x = rect.min.x + i as f32 * step;
-                            let y = rect.max.y - (v / max_val) as f32 * graph_h;
-                            egui::pos2(x, y.max(rect.min.y))
-                        }).collect();
-                        // Fill
-                        let mut fill = vec![egui::pos2(rect.min.x, rect.max.y)];
-                        fill.extend_from_slice(&points);
-                        fill.push(egui::pos2(rect.min.x + (n - 1) as f32 * step, rect.max.y));
-                        let fc = egui::Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), fill_alpha);
-                        painter.add(egui::Shape::convex_polygon(fill, fc, egui::Stroke::NONE));
-                        // Line
-                        for w in points.windows(2) {
-                            painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, color));
-                        }
-                    };
-
-                    let rx_vals: Vec<f64> = history.iter().map(|s| s.rx_bps).collect();
-                    let tx_vals: Vec<f64> = history.iter().map(|s| s.tx_bps).collect();
-                    draw_series(&rx_vals, cyan, 40);
-                    draw_series(&tx_vals, purple, 40);
-
-                    painter.text(
-                        egui::pos2(rect.max.x - 2.0, rect.min.y + 2.0),
-                        egui::Align2::RIGHT_TOP,
-                        fmt_rate(max_val),
-                        egui::FontId::proportional(9.0),
-                        label_color,
+                    ui.label(
+                        egui::RichText::new("System Status")
+                            .size(14.0)
+                            .strong()
+                            .color(header_color),
                     );
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("── RX").small().color(cyan));
-                    ui.label(egui::RichText::new("── TX").small().color(purple));
+                    if !ss.hostname.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(&ss.hostname).small().color(label_color));
+                        });
+                    }
                 });
-            }
-
-            // ── Top Processes ──
-            if !ss.top_procs.is_empty() {
-                ui.add_space(4.0);
                 ui.separator();
-                ui.label(egui::RichText::new("Top Processes").size(11.0).strong().color(value_color));
 
-                // Sort processes
-                let mut sorted_procs: Vec<&ProcessSnapshot> = ss.top_procs.iter().collect();
-                match state.proc_sort_col {
-                    1 => {
-                        // Sort by memory
-                        if state.proc_sort_asc {
-                            sorted_procs.sort_by(|a, b| a.mem_kb.cmp(&b.mem_kb));
-                        } else {
-                            sorted_procs.sort_by(|a, b| b.mem_kb.cmp(&a.mem_kb));
-                        }
-                    }
-                    _ => {
-                        // Sort by CPU (default)
-                        if state.proc_sort_asc {
-                            sorted_procs.sort_by(|a, b| a.cpu_pct.partial_cmp(&b.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
-                        } else {
-                            sorted_procs.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
-                        }
-                    }
-                }
-
-                let arrow = if state.proc_sort_asc { " ▲" } else { " ▼" };
-                egui::Grid::new("proc_grid")
-                    .num_columns(3)
-                    .spacing([6.0, 1.0])
-                    .striped(true)
+                // ── CPU & Memory ──
+                ui.label(
+                    egui::RichText::new("CPU / Memory")
+                        .size(11.0)
+                        .strong()
+                        .color(value_color),
+                );
+                egui::Grid::new("cpu_mem_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 2.0])
                     .show(ui, |ui| {
-                        // Clickable column headers
-                        let mem_label = if state.proc_sort_col == 1 { format!("Mem{arrow}") } else { "Mem".to_string() };
-                        let cpu_label = if state.proc_sort_col == 0 { format!("CPU{arrow}") } else { "CPU".to_string() };
-                        if ui.add(egui::Label::new(egui::RichText::new(mem_label).small().strong().color(label_color)).sense(egui::Sense::click())).clicked() {
-                            if state.proc_sort_col == 1 {
-                                state.proc_sort_asc = !state.proc_sort_asc;
-                            } else {
-                                state.proc_sort_col = 1;
-                                state.proc_sort_asc = false;
+                        let bar_w = 110.0;
+                        let bar_h = 12.0;
+
+                        // CPU
+                        ui.label(egui::RichText::new("CPU").small().color(label_color));
+                        let cpu_color = if ss.cpu_pct > 90.0 {
+                            red
+                        } else if ss.cpu_pct > 70.0 {
+                            yellow
+                        } else {
+                            green
+                        };
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(bar_w, bar_h),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 2.0, bar_bg);
+                            let fill_w = bar_w * (ss.cpu_pct / 100.0).min(1.0);
+                            if fill_w > 0.0 {
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_h)),
+                                    2.0,
+                                    cpu_color,
+                                );
                             }
-                        }
-                        if ui.add(egui::Label::new(egui::RichText::new(cpu_label).small().strong().color(label_color)).sense(egui::Sense::click())).clicked() {
-                            if state.proc_sort_col == 0 {
-                                state.proc_sort_asc = !state.proc_sort_asc;
-                            } else {
-                                state.proc_sort_col = 0;
-                                state.proc_sort_asc = false;
-                            }
-                        }
-                        ui.label(egui::RichText::new("Command").small().strong().color(label_color));
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", ss.cpu_pct))
+                                    .small()
+                                    .color(cpu_color),
+                            );
+                        });
                         ui.end_row();
-                        for p in &sorted_procs {
-                            ui.label(egui::RichText::new(&p.mem_str).small().color(value_color));
-                            let cpu_color = if p.cpu_pct > 50.0 { red } else if p.cpu_pct > 10.0 { yellow } else { green };
-                            ui.label(egui::RichText::new(format!("{:.1}", p.cpu_pct)).small().color(cpu_color));
-                            ui.label(egui::RichText::new(&p.name).small().color(label_color));
+
+                        // Memory
+                        ui.label(egui::RichText::new("Mem").small().color(label_color));
+                        let mem_pct = if ss.mem_total_mb > 0 {
+                            ss.mem_used_mb as f32 / ss.mem_total_mb as f32 * 100.0
+                        } else {
+                            0.0
+                        };
+                        let mem_color = if mem_pct > 90.0 {
+                            red
+                        } else if mem_pct > 70.0 {
+                            yellow
+                        } else {
+                            green
+                        };
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(bar_w, bar_h),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 2.0, bar_bg);
+                            let fill_w = bar_w * (mem_pct / 100.0).min(1.0);
+                            if fill_w > 0.0 {
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_h)),
+                                    2.0,
+                                    mem_color,
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}/{}",
+                                    fmt_mem_mb(ss.mem_used_mb),
+                                    fmt_mem_mb(ss.mem_total_mb)
+                                ))
+                                .small()
+                                .color(mem_color),
+                            );
+                        });
+                        ui.end_row();
+
+                        // Load
+                        if !ss.load_avg.is_empty() {
+                            ui.label(egui::RichText::new("Load").small().color(label_color));
+                            ui.label(egui::RichText::new(&ss.load_avg).small().color(value_color));
                             ui.end_row();
                         }
+                        // Uptime
+                        if !ss.uptime.is_empty() {
+                            ui.label(egui::RichText::new("Up").small().color(label_color));
+                            ui.label(egui::RichText::new(&ss.uptime).small().color(value_color));
+                            ui.end_row();
+                        }
+                        // Latency (true RTT via echo)
+                        ui.label(egui::RichText::new("RTT").small().color(label_color));
+                        let lat_color = if ss.latency_ms > 500 {
+                            red
+                        } else if ss.latency_ms > 200 {
+                            yellow
+                        } else {
+                            green
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{}ms", ss.latency_ms))
+                                .small()
+                                .color(lat_color),
+                        );
+                        ui.end_row();
                     });
-            }
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                // ── Disks ──
+                if !ss.disks.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Disks")
+                            .size(11.0)
+                            .strong()
+                            .color(value_color),
+                    );
+                    egui::Grid::new("disk_grid")
+                        .num_columns(4)
+                        .spacing([4.0, 1.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Mount")
+                                    .small()
+                                    .strong()
+                                    .color(label_color),
+                            );
+                            ui.label(
+                                egui::RichText::new("Type")
+                                    .small()
+                                    .strong()
+                                    .color(label_color),
+                            );
+                            ui.label(
+                                egui::RichText::new("Used/Total")
+                                    .small()
+                                    .strong()
+                                    .color(label_color),
+                            );
+                            ui.label(
+                                egui::RichText::new("Use%")
+                                    .small()
+                                    .strong()
+                                    .color(label_color),
+                            );
+                            ui.end_row();
+
+                            for d in &ss.disks {
+                                ui.label(egui::RichText::new(&d.mount).small().color(value_color));
+                                ui.label(egui::RichText::new(&d.fstype).small().color(label_color));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}/{}",
+                                        fmt_disk_size(&d.used),
+                                        fmt_disk_size(&d.total)
+                                    ))
+                                    .small()
+                                    .color(label_color),
+                                );
+                                let pct_num: f32 =
+                                    d.use_pct.trim_end_matches('%').parse().unwrap_or(0.0);
+                                let pct_color = if pct_num > 90.0 {
+                                    red
+                                } else if pct_num > 70.0 {
+                                    yellow
+                                } else {
+                                    green
+                                };
+                                ui.label(egui::RichText::new(&d.use_pct).small().color(pct_color));
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.separator();
+                }
+
+                // ── Network ──
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Network")
+                            .size(11.0)
+                            .strong()
+                            .color(value_color),
+                    );
+
+                    // Interface selector
+                    if !ss.net_interfaces.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let current_label = match state.selected_net_if {
+                                None => "All".to_string(),
+                                Some(idx) => ss
+                                    .net_interfaces
+                                    .get(idx)
+                                    .map(|i| i.name.clone())
+                                    .unwrap_or_else(|| "All".to_string()),
+                            };
+                            egui::ComboBox::from_id_salt("net_if_sel")
+                                .width(80.0)
+                                .selected_text(egui::RichText::new(&current_label).small())
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(state.selected_net_if.is_none(), "All")
+                                        .clicked()
+                                    {
+                                        state.selected_net_if = None;
+                                    }
+                                    for (i, iface) in ss.net_interfaces.iter().enumerate() {
+                                        if ui
+                                            .selectable_label(
+                                                state.selected_net_if == Some(i),
+                                                &iface.name,
+                                            )
+                                            .clicked()
+                                        {
+                                            state.selected_net_if = Some(i);
+                                        }
+                                    }
+                                });
+                        });
+                    }
+                });
+
+                // Pick the history to display
+                let history: &[NetRateSnapshot] = match state.selected_net_if {
+                    Some(idx) => ss
+                        .net_interfaces
+                        .get(idx)
+                        .map(|i| i.history.as_slice())
+                        .unwrap_or(&ss.net_history),
+                    None => &ss.net_history,
+                };
+
+                if history.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Collecting...")
+                            .small()
+                            .color(label_color),
+                    );
+                } else {
+                    // Current rate
+                    let last = history.last().unwrap();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("RX: {}", fmt_rate(last.rx_bps)))
+                                .small()
+                                .color(cyan),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("TX: {}", fmt_rate(last.tx_bps)))
+                                .small()
+                                .color(purple),
+                        );
+                    });
+
+                    // Sparkline area chart
+                    let graph_h = 60.0;
+                    let avail_w = ui.available_width();
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(avail_w, graph_h), egui::Sense::hover());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(240, 240, 240));
+
+                    let n = history.len();
+                    if n > 1 {
+                        let max_val = history
+                            .iter()
+                            .map(|s| s.rx_bps.max(s.tx_bps))
+                            .fold(1.0_f64, f64::max);
+                        let step = avail_w / (n.max(2) - 1) as f32;
+
+                        // Helper to draw an area + line
+                        let draw_series = |data: &[f64], color: egui::Color32, fill_alpha: u8| {
+                            let points: Vec<egui::Pos2> = data
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &v)| {
+                                    let x = rect.min.x + i as f32 * step;
+                                    let y = rect.max.y - (v / max_val) as f32 * graph_h;
+                                    egui::pos2(x, y.max(rect.min.y))
+                                })
+                                .collect();
+                            // Fill
+                            let mut fill = vec![egui::pos2(rect.min.x, rect.max.y)];
+                            fill.extend_from_slice(&points);
+                            fill.push(egui::pos2(rect.min.x + (n - 1) as f32 * step, rect.max.y));
+                            let fc = egui::Color32::from_rgba_premultiplied(
+                                color.r(),
+                                color.g(),
+                                color.b(),
+                                fill_alpha,
+                            );
+                            painter.add(egui::Shape::convex_polygon(fill, fc, egui::Stroke::NONE));
+                            // Line
+                            for w in points.windows(2) {
+                                painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, color));
+                            }
+                        };
+
+                        let rx_vals: Vec<f64> = history.iter().map(|s| s.rx_bps).collect();
+                        let tx_vals: Vec<f64> = history.iter().map(|s| s.tx_bps).collect();
+                        draw_series(&rx_vals, cyan, 40);
+                        draw_series(&tx_vals, purple, 40);
+
+                        painter.text(
+                            egui::pos2(rect.max.x - 2.0, rect.min.y + 2.0),
+                            egui::Align2::RIGHT_TOP,
+                            fmt_rate(max_val),
+                            egui::FontId::proportional(9.0),
+                            label_color,
+                        );
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("── RX").small().color(cyan));
+                        ui.label(egui::RichText::new("── TX").small().color(purple));
+                    });
+                }
+
+                // ── Top Processes ──
+                if !ss.top_procs.is_empty() {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Top Processes")
+                            .size(11.0)
+                            .strong()
+                            .color(value_color),
+                    );
+
+                    // Sort processes
+                    let mut sorted_procs: Vec<&ProcessSnapshot> = ss.top_procs.iter().collect();
+                    match state.proc_sort_col {
+                        1 => {
+                            // Sort by memory
+                            if state.proc_sort_asc {
+                                sorted_procs.sort_by(|a, b| a.mem_kb.cmp(&b.mem_kb));
+                            } else {
+                                sorted_procs.sort_by(|a, b| b.mem_kb.cmp(&a.mem_kb));
+                            }
+                        }
+                        _ => {
+                            // Sort by CPU (default)
+                            if state.proc_sort_asc {
+                                sorted_procs.sort_by(|a, b| {
+                                    a.cpu_pct
+                                        .partial_cmp(&b.cpu_pct)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            } else {
+                                sorted_procs.sort_by(|a, b| {
+                                    b.cpu_pct
+                                        .partial_cmp(&a.cpu_pct)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            }
+                        }
+                    }
+
+                    let arrow = if state.proc_sort_asc { " ▲" } else { " ▼" };
+                    egui::Grid::new("proc_grid")
+                        .num_columns(3)
+                        .spacing([6.0, 1.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            // Clickable column headers
+                            let mem_label = if state.proc_sort_col == 1 {
+                                format!("Mem{arrow}")
+                            } else {
+                                "Mem".to_string()
+                            };
+                            let cpu_label = if state.proc_sort_col == 0 {
+                                format!("CPU{arrow}")
+                            } else {
+                                "CPU".to_string()
+                            };
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(mem_label)
+                                            .small()
+                                            .strong()
+                                            .color(label_color),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .clicked()
+                            {
+                                if state.proc_sort_col == 1 {
+                                    state.proc_sort_asc = !state.proc_sort_asc;
+                                } else {
+                                    state.proc_sort_col = 1;
+                                    state.proc_sort_asc = false;
+                                }
+                            }
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(cpu_label)
+                                            .small()
+                                            .strong()
+                                            .color(label_color),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .clicked()
+                            {
+                                if state.proc_sort_col == 0 {
+                                    state.proc_sort_asc = !state.proc_sort_asc;
+                                } else {
+                                    state.proc_sort_col = 0;
+                                    state.proc_sort_asc = false;
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new("Command")
+                                    .small()
+                                    .strong()
+                                    .color(label_color),
+                            );
+                            ui.end_row();
+                            for p in &sorted_procs {
+                                ui.label(
+                                    egui::RichText::new(&p.mem_str).small().color(value_color),
+                                );
+                                let cpu_color = if p.cpu_pct > 50.0 {
+                                    red
+                                } else if p.cpu_pct > 10.0 {
+                                    yellow
+                                } else {
+                                    green
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("{:.1}", p.cpu_pct))
+                                        .small()
+                                        .color(cpu_color),
+                                );
+                                ui.label(egui::RichText::new(&p.name).small().color(label_color));
+                                ui.end_row();
+                            }
+                        });
+                }
             }); // ScrollArea
         });
 }
@@ -3273,11 +3918,7 @@ fn draw_system_panel(ctx: &egui::Context, state: &mut GuiState, ss: &ServerStatu
 
 const AGENT_PANEL_WIDTH: f32 = 340.0;
 
-fn draw_agent_panel(
-    ctx: &egui::Context,
-    state: &mut GuiState,
-    actions: &mut Vec<GuiAction>,
-) {
+fn draw_agent_panel(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<GuiAction>) {
     egui::SidePanel::right("agent_panel")
         .resizable(true)
         .default_width(AGENT_PANEL_WIDTH)
@@ -3308,28 +3949,42 @@ fn draw_agent_panel(
                             .width(100.0)
                             .selected_text(&state.agent_provider_type)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut state.agent_provider_type, "openai".into(), "OpenAI");
-                                ui.selectable_value(&mut state.agent_provider_type, "anthropic".into(), "Anthropic");
+                                ui.selectable_value(
+                                    &mut state.agent_provider_type,
+                                    "openai".into(),
+                                    "OpenAI",
+                                );
+                                ui.selectable_value(
+                                    &mut state.agent_provider_type,
+                                    "anthropic".into(),
+                                    "Anthropic",
+                                );
                             });
                     });
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Base URL").size(11.0));
-                        ui.add(egui::TextEdit::singleline(&mut state.agent_base_url)
-                            .desired_width(180.0)
-                            .font(egui::TextStyle::Small));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.agent_base_url)
+                                .desired_width(180.0)
+                                .font(egui::TextStyle::Small),
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("API Key ").size(11.0));
-                        ui.add(egui::TextEdit::singleline(&mut state.agent_api_key)
-                            .desired_width(180.0)
-                            .password(true)
-                            .font(egui::TextStyle::Small));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.agent_api_key)
+                                .desired_width(180.0)
+                                .password(true)
+                                .font(egui::TextStyle::Small),
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Model   ").size(11.0));
-                        ui.add(egui::TextEdit::singleline(&mut state.agent_model_id)
-                            .desired_width(180.0)
-                            .font(egui::TextStyle::Small));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.agent_model_id)
+                                .desired_width(180.0)
+                                .font(egui::TextStyle::Small),
+                        );
                     });
                     if ui.small_button("应用配置").clicked() {
                         actions.push(GuiAction::AgentConfigure {
@@ -3363,15 +4018,16 @@ fn draw_agent_panel(
                     }
 
                     for msg in &state.agent_messages {
-                        draw_agent_message(ui, msg);
+                        draw_agent_message(ui, &mut state.agent_md_cache, msg);
                     }
 
                     // Show streaming text if agent is running
                     if !state.agent_streaming_text.is_empty() {
-                        draw_agent_message(ui, &AgentChatMessage {
+                        let streaming = AgentChatMessage {
                             role: AgentChatRole::Assistant,
                             content: state.agent_streaming_text.clone(),
-                        });
+                        };
+                        draw_agent_message(ui, &mut state.agent_md_cache, &streaming);
                     }
 
                     if state.agent_is_running && state.agent_streaming_text.is_empty() {
@@ -3391,11 +4047,10 @@ fn draw_agent_panel(
                         .hint_text("输入消息...")
                         .font(egui::TextStyle::Body),
                 );
-                let enter_pressed = input_response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let enter_pressed =
+                    input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let send_clicked = if state.agent_is_running {
-                    ui.add_enabled(true, egui::Button::new("取消"))
-                        .clicked()
+                    ui.add_enabled(true, egui::Button::new("取消")).clicked()
                 } else {
                     ui.add_enabled(
                         !state.agent_input.trim().is_empty(),
@@ -3425,7 +4080,11 @@ fn draw_agent_panel(
         });
 }
 
-fn draw_agent_message(ui: &mut egui::Ui, msg: &AgentChatMessage) {
+fn draw_agent_message(
+    ui: &mut egui::Ui,
+    md_cache: &mut egui_commonmark::CommonMarkCache,
+    msg: &AgentChatMessage,
+) {
     let (prefix, color, bg) = match msg.role {
         AgentChatRole::User => (
             "You",
@@ -3456,7 +4115,771 @@ fn draw_agent_message(ui: &mut egui::Ui, msg: &AgentChatMessage) {
         .outer_margin(egui::Margin::symmetric(0, 2))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // Re-enable text selection *inside* this message frame so the user
+            // can drag-select and Ctrl+C the content. The global style keeps
+            // selection off so Tab still goes to the PTY; scoping it here
+            // doesn't affect the rest of the UI.
+            ui.style_mut().interaction.selectable_labels = true;
+
             ui.label(egui::RichText::new(prefix).size(10.0).strong().color(color));
-            ui.label(egui::RichText::new(&msg.content).size(12.0));
+            // Render assistant replies as Markdown; keep user/tool/error as plain
+            // text so we don't accidentally interpret command output or error
+            // strings as markup.
+            match msg.role {
+                AgentChatRole::Assistant => {
+                    egui_commonmark::CommonMarkViewer::new()
+                        .max_image_width(Some(320))
+                        .show(ui, md_cache, &msg.content);
+                }
+                _ => {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&msg.content).size(12.0))
+                            .selectable(true),
+                    );
+                }
+            }
         });
+}
+
+// ---------------------------------------------------------------------------
+// Docker panel
+// ---------------------------------------------------------------------------
+
+const DOCKER_PANEL_WIDTH: f32 = 380.0;
+
+/// One entry in the `docker exec` shell picker.
+struct DockerShellChoice {
+    /// Small visual marker shown next to the label.
+    icon: &'static str,
+    /// Human label displayed in the menu.
+    label: &'static str,
+    /// What gets passed to `docker exec` as the command argument. The app
+    /// resolves bare names like `bash` against the container's `$PATH`,
+    /// while absolute paths are used as-is.
+    command: &'static str,
+}
+
+/// Common shell choices offered when launching `docker exec`. Order is
+/// significant — the most likely choice for a developer image (`bash`) is
+/// first. Alpine / distroless users will pick `sh` or `ash`; busybox-based
+/// images default to `sh` which is universally present.
+const DOCKER_EXEC_SHELLS: &[DockerShellChoice] = &[
+    DockerShellChoice {
+        icon: "🐚",
+        label: "bash",
+        command: "bash",
+    },
+    DockerShellChoice {
+        icon: "🐚",
+        label: "sh",
+        command: "/bin/sh",
+    },
+    DockerShellChoice {
+        icon: "🐚",
+        label: "zsh",
+        command: "zsh",
+    },
+    DockerShellChoice {
+        icon: "🐚",
+        label: "ash (alpine)",
+        command: "ash",
+    },
+    DockerShellChoice {
+        icon: "🐚",
+        label: "fish",
+        command: "fish",
+    },
+];
+
+// ---------------------------------------------------------------------------
+// VTE -> styled-line snapshot for the docker logs viewer
+// ---------------------------------------------------------------------------
+
+/// Default foreground used to resolve `VteColor::Default` when an explicit
+/// colour is required (currently only for the inverse-video swap).
+const LOG_DEFAULT_FG: egui::Color32 = egui::Color32::from_rgb(0xd4, 0xd4, 0xd4);
+/// Default background mate to [`LOG_DEFAULT_FG`].
+const LOG_DEFAULT_BG: egui::Color32 = egui::Color32::from_rgb(0x16, 0x16, 0x16);
+
+/// Walk the parser's grid (scrollback + active screen) and return a fresh
+/// vector of styled lines suitable for the log viewer.
+///
+/// Trailing all-blank rows are trimmed so the active grid's empty tail
+/// doesn't push real content out of view. Within each row, runs of cells
+/// sharing fg/bg/attrs are merged into a single [`LogSpan`].
+pub fn snapshot_log_lines(parser: &nexterm_vte::parser::TerminalParser) -> Vec<LogLine> {
+    let grid = parser.grid();
+    let mut out: Vec<LogLine> = Vec::with_capacity(grid.scrollback.len() + grid.rows);
+    for row in &grid.scrollback {
+        out.push(row_to_log_line(row));
+    }
+    for row in &grid.cells {
+        out.push(row_to_log_line(row));
+    }
+    while out.last().map_or(false, LogLine::is_blank) {
+        out.pop();
+    }
+    out
+}
+
+/// Convert one grid row into a [`LogLine`], merging consecutive cells with
+/// matching style attributes into the same [`LogSpan`].
+fn row_to_log_line(cells: &[nexterm_vte::grid::Cell]) -> LogLine {
+    use nexterm_vte::grid::CellAttrs;
+
+    // Trim trailing default-style spaces so we don't emit pages of empty
+    // cells for short log lines on a wide grid.
+    let trim_to = cells
+        .iter()
+        .rposition(|c| !is_blank_default_cell(c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if trim_to == 0 {
+        return LogLine::default();
+    }
+
+    /// Compact style fingerprint used to decide span boundaries. Two cells
+    /// are merged iff every field here matches.
+    #[derive(PartialEq, Eq)]
+    struct StyleKey {
+        fg: u64,
+        bg: u64,
+        attrs: u16,
+    }
+    let key_of = |cell: &nexterm_vte::grid::Cell| StyleKey {
+        fg: encode_color(cell.fg),
+        bg: encode_color(cell.bg),
+        attrs: cell.attrs.bits(),
+    };
+
+    let mut spans: Vec<LogSpan> = Vec::new();
+    let mut cur_text = String::new();
+    let mut cur_key: Option<StyleKey> = None;
+    let mut cur_span_proto: LogSpan = LogSpan::default();
+
+    for cell in &cells[..trim_to] {
+        let k = key_of(cell);
+        if cur_key.as_ref() != Some(&k) {
+            if !cur_text.is_empty() {
+                let mut finished = std::mem::take(&mut cur_span_proto);
+                finished.text = std::mem::take(&mut cur_text);
+                spans.push(finished);
+            }
+            cur_span_proto = span_proto_from_cell(cell);
+            cur_key = Some(k);
+        }
+        cur_text.push(cell.ch);
+        // WIDE_TAIL cells are placeholders for the second column of a
+        // double-width glyph; the actual char is in the preceding cell so
+        // we skip emitting a duplicate space here. (It comes through as
+        // `ch == ' '` with WIDE_TAIL set.)
+        if cell.attrs.contains(CellAttrs::WIDE_TAIL) {
+            cur_text.pop();
+        }
+    }
+    if !cur_text.is_empty() {
+        let mut finished = cur_span_proto;
+        finished.text = cur_text;
+        spans.push(finished);
+    }
+    LogLine { spans }
+}
+
+/// Build a partially-filled [`LogSpan`] that captures a cell's style. The
+/// caller fills in `text` afterwards once the run is complete.
+fn span_proto_from_cell(cell: &nexterm_vte::grid::Cell) -> LogSpan {
+    use nexterm_vte::grid::CellAttrs;
+    let mut fg = vte_color_to_egui(cell.fg);
+    let mut bg = vte_color_to_egui(cell.bg);
+    if cell.attrs.contains(CellAttrs::INVERSE) {
+        // Swap; resolve any None into our concrete defaults so the
+        // inversion is actually visible against the panel background.
+        let new_fg = bg.unwrap_or(LOG_DEFAULT_BG);
+        let new_bg = fg.unwrap_or(LOG_DEFAULT_FG);
+        fg = Some(new_fg);
+        bg = Some(new_bg);
+    }
+    if cell.attrs.contains(CellAttrs::HIDDEN) {
+        // HIDDEN: glyphs render in the background colour. Make fg match bg
+        // (or the panel default) so the text is visually erased.
+        fg = bg.or(Some(LOG_DEFAULT_BG));
+    }
+    LogSpan {
+        text: String::new(),
+        fg,
+        bg,
+        bold: cell.attrs.contains(CellAttrs::BOLD),
+        dim: cell.attrs.contains(CellAttrs::DIM),
+        italic: cell.attrs.contains(CellAttrs::ITALIC),
+        underline: cell.attrs.contains(CellAttrs::UNDERLINE),
+        strikethrough: cell.attrs.contains(CellAttrs::STRIKETHROUGH),
+    }
+}
+
+/// Encode a [`nexterm_vte::grid::Color`] into a small integer for fast
+/// equality comparisons inside hot loops.
+fn encode_color(c: nexterm_vte::grid::Color) -> u64 {
+    use nexterm_vte::grid::Color;
+    match c {
+        Color::Default => 0,
+        Color::Indexed(i) => 1 << 32 | i as u64,
+        Color::Rgb(r, g, b) => 2 << 32 | ((r as u64) << 16) | ((g as u64) << 8) | b as u64,
+    }
+}
+
+/// Map a VT colour to an `egui::Color32`. `Color::Default` returns `None`
+/// so the renderer can fall back to the panel's text colour.
+fn vte_color_to_egui(c: nexterm_vte::grid::Color) -> Option<egui::Color32> {
+    use nexterm_vte::grid::Color;
+    match c {
+        Color::Default => None,
+        Color::Indexed(i) => Some(palette256(i)),
+        Color::Rgb(r, g, b) => Some(egui::Color32::from_rgb(r, g, b)),
+    }
+}
+
+/// Standard XTerm 256-colour palette used for indexed colours emitted by
+/// the VTE parser. The 16 base colours match VS Code's terminal theme so
+/// the log viewer feels consistent with most developers' expectations.
+fn palette256(idx: u8) -> egui::Color32 {
+    if idx < 16 {
+        // 0..7 = normal, 8..15 = bright. Tuned to match VS Code dark.
+        const BASE: [(u8, u8, u8); 16] = [
+            (0x00, 0x00, 0x00), // black
+            (0xcd, 0x31, 0x31), // red
+            (0x0d, 0xbc, 0x79), // green
+            (0xe5, 0xe5, 0x10), // yellow
+            (0x24, 0x72, 0xc8), // blue
+            (0xbc, 0x3f, 0xbc), // magenta
+            (0x11, 0xa8, 0xcd), // cyan
+            (0xe5, 0xe5, 0xe5), // white
+            (0x66, 0x66, 0x66), // bright black
+            (0xf1, 0x4c, 0x4c), // bright red
+            (0x23, 0xd1, 0x8b), // bright green
+            (0xf5, 0xf5, 0x43), // bright yellow
+            (0x3b, 0x8e, 0xea), // bright blue
+            (0xd6, 0x70, 0xd6), // bright magenta
+            (0x29, 0xb8, 0xdb), // bright cyan
+            (0xff, 0xff, 0xff), // bright white
+        ];
+        let (r, g, b) = BASE[idx as usize];
+        egui::Color32::from_rgb(r, g, b)
+    } else if idx < 232 {
+        // 6×6×6 RGB cube.
+        let i = idx - 16;
+        let r = (i / 36) % 6;
+        let g = (i / 6) % 6;
+        let b = i % 6;
+        let scale = |x: u8| if x == 0 { 0 } else { 55 + x * 40 };
+        egui::Color32::from_rgb(scale(r), scale(g), scale(b))
+    } else {
+        // 24-step grayscale ramp.
+        let v = 8 + (idx - 232).saturating_mul(10);
+        egui::Color32::from_rgb(v, v, v)
+    }
+}
+
+/// True for cells that contribute nothing to the rendered line: a default
+/// space with no styling.
+#[inline]
+fn is_blank_default_cell(cell: &nexterm_vte::grid::Cell) -> bool {
+    use nexterm_vte::grid::Color;
+    cell.ch == ' '
+        && matches!(cell.fg, Color::Default)
+        && matches!(cell.bg, Color::Default)
+        && cell.attrs.is_empty()
+}
+
+fn draw_docker_panel(ctx: &egui::Context, state: &mut GuiState, actions: &mut Vec<GuiAction>) {
+    egui::SidePanel::right("docker_panel")
+        .resizable(true)
+        .default_width(DOCKER_PANEL_WIDTH)
+        .min_width(320.0)
+        .max_width(640.0)
+        .show(ctx, |ui| {
+            // ── Header ──────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new("Docker").size(14.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("关闭面板").clicked() {
+                        actions.push(GuiAction::ToggleDockerPanel);
+                    }
+                    if ui.small_button("↻").on_hover_text("刷新容器列表").clicked() {
+                        actions.push(GuiAction::DockerRefresh);
+                    }
+                });
+            });
+            ui.separator();
+
+            // ── Error banner ────────────────────────────────────────
+            if let Some(err) = state.docker.error.clone() {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(120, 30, 30, 40))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(6))
+                    .outer_margin(egui::Margin::symmetric(0, 2))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("✗ ")
+                                    .color(egui::Color32::from_rgb(255, 100, 100))
+                                    .strong(),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&err)
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(200, 100, 100)),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        });
+                    });
+            }
+
+            // ── Docker unavailable banner ───────────────────────────
+            if matches!(state.docker.docker_available, Some(false)) {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(
+                        egui::RichText::new("Docker 在当前主机上不可用")
+                            .size(13.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "请确认 docker 已安装且守护进程正在运行，\n然后点击右上角的 ↻ 重试。",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(130)),
+                    );
+                });
+                return;
+            }
+
+            // ── Filter row ──────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.docker.filter_query)
+                        .hint_text("过滤 name / image / id")
+                        .desired_width(ui.available_width() - 90.0)
+                        .font(egui::TextStyle::Small),
+                );
+                let prev_show_all = state.docker.show_all;
+                ui.checkbox(&mut state.docker.show_all, "全部");
+                if prev_show_all != state.docker.show_all {
+                    // Toggling the scope should re-fetch so the list matches.
+                    actions.push(GuiAction::DockerRefresh);
+                }
+            });
+            ui.separator();
+
+            // ── Loading indicator ───────────────────────────────────
+            if state.docker.loading && state.docker.containers.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.spinner();
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("正在加载容器列表…")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                });
+                return;
+            }
+
+            // ── Container list ──────────────────────────────────────
+            let filter = state.docker.filter_query.to_lowercase();
+            let filtered: Vec<usize> = state
+                .docker
+                .containers
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    if filter.is_empty() {
+                        return true;
+                    }
+                    c.names.iter().any(|n| n.to_lowercase().contains(&filter))
+                        || c.image.to_lowercase().contains(&filter)
+                        || c.id.to_lowercase().contains(&filter)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if filtered.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    let msg = if state.docker.containers.is_empty() {
+                        if state.docker.show_all {
+                            "没有任何容器"
+                        } else {
+                            "当前没有运行中的容器\n勾选「全部」看包含已停止的"
+                        }
+                    } else {
+                        "没有符合过滤条件的容器"
+                    };
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(130)),
+                    );
+                });
+                return;
+            }
+
+            // When a log stream is active we split the panel: top half for
+            // the container list, bottom half for the log viewer.
+            let log_active = state.docker.log_streaming_id.is_some();
+            let list_max_height = if log_active {
+                (ui.available_height() * 0.5).max(100.0)
+            } else {
+                ui.available_height()
+            };
+
+            egui::ScrollArea::vertical()
+                .id_salt("docker_container_list")
+                .auto_shrink([false; 2])
+                .max_height(list_max_height)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    for i in filtered {
+                        let container = state.docker.containers[i].clone();
+                        draw_docker_row(
+                            ui,
+                            &container,
+                            state.docker.selected_id.as_deref() == Some(container.id.as_str()),
+                            actions,
+                        );
+                    }
+                });
+
+            // Log viewer (if streaming).
+            if log_active {
+                draw_docker_log_viewer(ui, state, actions);
+            }
+        });
+}
+
+/// Bottom-half log viewer in the Docker panel. Rendered only when
+/// `state.docker.log_streaming_id` is `Some`.
+fn draw_docker_log_viewer(ui: &mut egui::Ui, state: &mut GuiState, actions: &mut Vec<GuiAction>) {
+    ui.separator();
+
+    // Header: container name + live/ended + auto-scroll toggle + close.
+    ui.horizontal(|ui| {
+        let name = state
+            .docker
+            .log_streaming_name
+            .as_deref()
+            .or(state.docker.log_streaming_id.as_deref())
+            .unwrap_or("logs");
+        let suffix = if state.docker.log_streaming {
+            " · live"
+        } else {
+            " · ended"
+        };
+        ui.label(
+            egui::RichText::new(format!("📜 {name}{suffix}"))
+                .size(12.0)
+                .strong(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("✕")
+                .on_hover_text("停止并关闭日志")
+                .clicked()
+            {
+                actions.push(GuiAction::DockerStopLogs);
+            }
+            ui.checkbox(&mut state.docker.log_auto_scroll, "自动滚动");
+        });
+    });
+
+    // Scrollable log body. Each line is rendered as a single LayoutJob
+    // built from the snapshot's styled spans — that lets text selection
+    // span colour boundaries while still preserving SGR colours.
+    egui::ScrollArea::vertical()
+        .id_salt("docker_log_viewer")
+        .auto_shrink([false; 2])
+        .stick_to_bottom(state.docker.log_auto_scroll)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.style_mut().interaction.selectable_labels = true;
+            if state.docker.log_lines.is_empty() {
+                ui.label(
+                    egui::RichText::new("(等待日志输出…)")
+                        .size(10.5)
+                        .color(egui::Color32::from_gray(130))
+                        .italics(),
+                );
+            } else {
+                draw_log_lines(ui, &state.docker.log_lines);
+            }
+        });
+}
+
+/// Render a slice of styled log lines into the current `ui`. Each line is
+/// a single `LayoutJob` so colour transitions don't break selection.
+fn draw_log_lines(ui: &mut egui::Ui, lines: &[LogLine]) {
+    use egui::text::{LayoutJob, TextFormat};
+
+    // Tight spacing — log output should pack densely like a real terminal.
+    ui.spacing_mut().item_spacing.y = 0.0;
+
+    let panel_text_color = ui.visuals().text_color();
+    // Wrap width = the panel's available width so long lines flow nicely.
+    let wrap_width = ui.available_width().max(160.0);
+
+    for line in lines {
+        if line.is_blank() {
+            // Preserve vertical rhythm for blank lines.
+            ui.label(egui::RichText::new(" ").monospace().size(10.5));
+            continue;
+        }
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+        job.wrap.break_anywhere = true; // log lines have no natural breaks
+        for span in &line.spans {
+            // Bold needs the monospace_bold family if the egui font setup
+            // provides one; falling back to a slightly larger size keeps
+            // bold visually distinct even with a single-weight font.
+            let font_id = if span.bold {
+                egui::FontId::new(11.0, egui::FontFamily::Monospace)
+            } else {
+                egui::FontId::monospace(10.5)
+            };
+            let mut color = span.fg.unwrap_or(panel_text_color);
+            if span.dim {
+                // 60% alpha gives a perceptible dim without losing the hue.
+                color = color.gamma_multiply(0.6);
+            }
+            let bg = span.bg.unwrap_or(egui::Color32::TRANSPARENT);
+            let fmt = TextFormat {
+                font_id,
+                color,
+                background: bg,
+                italics: span.italic,
+                underline: if span.underline {
+                    egui::Stroke::new(1.0, color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                strikethrough: if span.strikethrough {
+                    egui::Stroke::new(1.0, color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                ..Default::default()
+            };
+            job.append(&span.text, 0.0, fmt);
+        }
+        ui.add(egui::Label::new(job).selectable(true));
+    }
+}
+
+fn draw_docker_row(
+    ui: &mut egui::Ui,
+    c: &nexterm_docker::ContainerInfo,
+    selected: bool,
+    actions: &mut Vec<GuiAction>,
+) {
+    let (dot_color, badge_color) = status_colors(&c.status);
+    let bg = if selected {
+        egui::Color32::from_rgba_premultiplied(60, 120, 180, 40)
+    } else {
+        egui::Color32::from_rgba_premultiplied(40, 40, 40, 20)
+    };
+
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::same(6))
+        .outer_margin(egui::Margin::symmetric(0, 2))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            // Row 1: status dot + name + status badge (right-aligned)
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").color(dot_color).size(13.0));
+                let name_resp = ui.add(
+                    egui::Label::new(egui::RichText::new(c.display_name()).size(12.0).strong())
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                );
+                if name_resp.clicked() {
+                    actions.push(GuiAction::DockerSelect(c.id.clone()));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(c.status.short_label())
+                            .size(10.0)
+                            .color(badge_color),
+                    );
+                });
+            });
+
+            // Row 2: image · short id
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&c.image)
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(150)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(c.short_id())
+                                .size(10.0)
+                                .monospace()
+                                .color(egui::Color32::from_gray(120)),
+                        )
+                        .selectable(true),
+                    );
+                });
+            });
+
+            // Row 3 (optional): status_raw (e.g. "Up 3 hours", "Exited (0) 2 days ago")
+            if !c.status_raw.is_empty() {
+                ui.label(
+                    egui::RichText::new(&c.status_raw)
+                        .size(10.0)
+                        .color(egui::Color32::from_gray(130)),
+                );
+            }
+
+            // Row 4: ports (collapsed to a single line)
+            if !c.ports.is_empty() {
+                let ports_str = c
+                    .ports
+                    .iter()
+                    .map(|p| match (p.host_port, p.host_ip.as_deref()) {
+                        (Some(hp), Some(ip)) => {
+                            format!("{ip}:{hp}→{}/{}", p.container_port, p.protocol)
+                        }
+                        (Some(hp), None) => format!("{hp}→{}/{}", p.container_port, p.protocol),
+                        _ => format!("{}/{}", p.container_port, p.protocol),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(ports_str)
+                            .size(10.0)
+                            .monospace()
+                            .color(egui::Color32::from_gray(140)),
+                    )
+                    .wrap()
+                    .selectable(true),
+                );
+            }
+
+            // Row 5: action buttons. Show a context-appropriate set.
+            ui.horizontal(|ui| {
+                // Logs works regardless of state (even exited containers
+                // retain their logs until removed).
+                if ui.small_button("📜 Logs").clicked() {
+                    actions.push(GuiAction::DockerViewLogs(c.id.clone()));
+                }
+                match &c.status {
+                    nexterm_docker::ContainerStatus::Running
+                    | nexterm_docker::ContainerStatus::Paused
+                    | nexterm_docker::ContainerStatus::Restarting => {
+                        // Split affordance: clicking the main button uses
+                        // the default shell (sh, universal), while the
+                        // chevron opens a picker with the common choices.
+                        if ui
+                            .small_button("▶ Exec")
+                            .on_hover_text("docker exec -it /bin/sh\n(右侧 ▾ 选择 shell)")
+                            .clicked()
+                        {
+                            actions.push(GuiAction::DockerExec {
+                                id: c.id.clone(),
+                                shell: String::new(), // app picks default (/bin/sh)
+                            });
+                        }
+                        ui.menu_button("▾", |ui| {
+                            ui.set_min_width(140.0);
+                            ui.label(
+                                egui::RichText::new("选择 shell")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(150)),
+                            );
+                            ui.separator();
+                            for shell in DOCKER_EXEC_SHELLS {
+                                if ui
+                                    .button(format!("{} {}", shell.icon, shell.label))
+                                    .clicked()
+                                {
+                                    actions.push(GuiAction::DockerExec {
+                                        id: c.id.clone(),
+                                        shell: shell.command.to_string(),
+                                    });
+                                    ui.close_menu();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Choose shell");
+                        if ui.small_button("■ Stop").clicked() {
+                            actions.push(GuiAction::DockerStop(c.id.clone()));
+                        }
+                        if ui.small_button("↻ Restart").clicked() {
+                            actions.push(GuiAction::DockerRestart(c.id.clone()));
+                        }
+                    }
+                    nexterm_docker::ContainerStatus::Exited { .. }
+                    | nexterm_docker::ContainerStatus::Created
+                    | nexterm_docker::ContainerStatus::Dead => {
+                        if ui.small_button("▶ Start").clicked() {
+                            actions.push(GuiAction::DockerStart(c.id.clone()));
+                        }
+                        if ui.small_button("🗑 Remove").clicked() {
+                            actions.push(GuiAction::DockerRemove {
+                                id: c.id.clone(),
+                                force: false,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        });
+}
+
+fn status_colors(s: &nexterm_docker::ContainerStatus) -> (egui::Color32, egui::Color32) {
+    use nexterm_docker::ContainerStatus as S;
+    match s {
+        S::Running => (
+            egui::Color32::from_rgb(80, 200, 120),
+            egui::Color32::from_rgb(80, 200, 120),
+        ),
+        S::Paused => (
+            egui::Color32::from_rgb(230, 180, 60),
+            egui::Color32::from_rgb(230, 180, 60),
+        ),
+        S::Restarting => (
+            egui::Color32::from_rgb(100, 180, 240),
+            egui::Color32::from_rgb(100, 180, 240),
+        ),
+        S::Created => (
+            egui::Color32::from_rgb(160, 160, 160),
+            egui::Color32::from_rgb(160, 160, 160),
+        ),
+        S::Removing => (
+            egui::Color32::from_rgb(200, 140, 80),
+            egui::Color32::from_rgb(200, 140, 80),
+        ),
+        S::Dead | S::Exited { .. } => (
+            egui::Color32::from_rgb(180, 80, 80),
+            egui::Color32::from_rgb(180, 80, 80),
+        ),
+        S::Unknown(_) => (
+            egui::Color32::from_rgb(130, 130, 130),
+            egui::Color32::from_rgb(130, 130, 130),
+        ),
+    }
 }

@@ -1,34 +1,32 @@
 //! CPU-side text renderer: rasterizes the terminal grid into an RGBA pixel buffer
 //! using cosmic-text for font shaping and swash for glyph rasterization.
 
-use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
-};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent};
 use nexterm_vte::grid::{Color, Grid};
 
 /// ANSI 16-color palette (Catppuccin Mocha inspired).
 const ANSI_COLORS: [[u8; 3]; 16] = [
-    [69, 71, 90],     // 0  black   (surface1)
-    [243, 139, 168],  // 1  red
-    [166, 227, 161],  // 2  green
-    [249, 226, 175],  // 3  yellow
-    [137, 180, 250],  // 4  blue
-    [245, 194, 231],  // 5  magenta
-    [148, 226, 213],  // 6  cyan
-    [186, 194, 222],  // 7  white   (subtext1)
-    [88, 91, 112],    // 8  bright black  (surface2)
-    [243, 139, 168],  // 9  bright red
-    [166, 227, 161],  // 10 bright green
-    [249, 226, 175],  // 11 bright yellow
-    [137, 180, 250],  // 12 bright blue
-    [245, 194, 231],  // 13 bright magenta
-    [148, 226, 213],  // 14 bright cyan
-    [205, 214, 244],  // 15 bright white (text)
+    [69, 71, 90],    // 0  black   (surface1)
+    [243, 139, 168], // 1  red
+    [166, 227, 161], // 2  green
+    [249, 226, 175], // 3  yellow
+    [137, 180, 250], // 4  blue
+    [245, 194, 231], // 5  magenta
+    [148, 226, 213], // 6  cyan
+    [186, 194, 222], // 7  white   (subtext1)
+    [88, 91, 112],   // 8  bright black  (surface2)
+    [243, 139, 168], // 9  bright red
+    [166, 227, 161], // 10 bright green
+    [249, 226, 175], // 11 bright yellow
+    [137, 180, 250], // 12 bright blue
+    [245, 194, 231], // 13 bright magenta
+    [148, 226, 213], // 14 bright cyan
+    [205, 214, 244], // 15 bright white (text)
 ];
 
 /// Default foreground / background as RGB.
 const DEFAULT_FG: [u8; 3] = [205, 214, 244]; // #cdd6f4
-const DEFAULT_BG: [u8; 3] = [30, 30, 46];    // #1e1e2e
+const DEFAULT_BG: [u8; 3] = [30, 30, 46]; // #1e1e2e
 
 /// Renders a `Grid` to an RGBA pixel buffer using cosmic-text.
 pub struct TextRenderer {
@@ -156,10 +154,9 @@ impl TextRenderer {
                     };
 
                     let physical = glyph.physical((0.0, 0.0), 1.0);
-                    let image = self.swash_cache.get_image_uncached(
-                        &mut self.font_system,
-                        physical.cache_key,
-                    );
+                    let image = self
+                        .swash_cache
+                        .get_image_uncached(&mut self.font_system, physical.cache_key);
                     let image = match image {
                         Some(img) => img,
                         None => continue,
@@ -198,13 +195,14 @@ impl TextRenderer {
                                     let inv = 255 - alpha;
                                     pixel_buf[dst] = ((fg[0] as u32 * alpha
                                         + pixel_buf[dst] as u32 * inv)
-                                        / 255) as u8;
-                                    pixel_buf[dst + 1] = ((fg[1] as u32 * alpha
-                                        + pixel_buf[dst + 1] as u32 * inv)
-                                        / 255) as u8;
-                                    pixel_buf[dst + 2] = ((fg[2] as u32 * alpha
-                                        + pixel_buf[dst + 2] as u32 * inv)
-                                        / 255) as u8;
+                                        / 255)
+                                        as u8;
+                                    pixel_buf[dst + 1] =
+                                        ((fg[1] as u32 * alpha + pixel_buf[dst + 1] as u32 * inv)
+                                            / 255) as u8;
+                                    pixel_buf[dst + 2] =
+                                        ((fg[2] as u32 * alpha + pixel_buf[dst + 2] as u32 * inv)
+                                            / 255) as u8;
                                     pixel_buf[dst + 3] = 255;
                                 }
                                 SwashContent::Color => {
@@ -235,8 +233,7 @@ impl TextRenderer {
                     // Semi-transparent white cursor
                     let alpha = 160u32;
                     let inv = 255 - alpha;
-                    pixel_buf[idx] =
-                        ((205u32 * alpha + pixel_buf[idx] as u32 * inv) / 255) as u8;
+                    pixel_buf[idx] = ((205u32 * alpha + pixel_buf[idx] as u32 * inv) / 255) as u8;
                     pixel_buf[idx + 1] =
                         ((214u32 * alpha + pixel_buf[idx + 1] as u32 * inv) / 255) as u8;
                     pixel_buf[idx + 2] =

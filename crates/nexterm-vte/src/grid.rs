@@ -51,7 +51,7 @@ pub struct Block {
 }
 
 /// Ordered list of command blocks.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BlockList {
     blocks: Vec<Block>,
     next_id: u64,
@@ -62,7 +62,11 @@ pub struct BlockList {
 
 impl BlockList {
     pub fn new() -> Self {
-        Self { blocks: Vec::new(), next_id: 0, has_osc133: false }
+        Self {
+            blocks: Vec::new(),
+            next_id: 0,
+            has_osc133: false,
+        }
     }
 
     /// Reset the block list (e.g. on screen clear). Creates a fresh initial block.
@@ -103,7 +107,9 @@ impl BlockList {
             tracing::info!("start_block: has_osc133 + EnterKey → just mark executing");
             return self.blocks.last().map(|b| b.id).unwrap_or(0);
         }
-        if trigger == BlockTrigger::Osc133A { self.has_osc133 = true; }
+        if trigger == BlockTrigger::Osc133A {
+            self.has_osc133 = true;
+        }
 
         // Finalize previous block
         if let Some(prev) = self.blocks.last_mut() {
@@ -125,7 +131,9 @@ impl BlockList {
         let id = self.next_id;
         self.next_id += 1;
         self.blocks.push(Block {
-            id, start_row, trigger,
+            id,
+            start_row,
+            trigger,
             state: BlockState::Prompt,
             created_at: ts,
             exit_code: None,
@@ -170,12 +178,18 @@ impl BlockList {
     /// Find the block containing `abs_row`. Returns (index, &Block).
     pub fn block_for_row(&self, abs_row: usize) -> Option<(usize, &Block)> {
         let idx = self.blocks.partition_point(|b| b.start_row <= abs_row);
-        if idx == 0 { None } else { Some((idx - 1, &self.blocks[idx - 1])) }
+        if idx == 0 {
+            None
+        } else {
+            Some((idx - 1, &self.blocks[idx - 1]))
+        }
     }
 
     /// Is this absolute row the start of a block?
     pub fn is_block_start(&self, abs_row: usize) -> bool {
-        self.blocks.binary_search_by_key(&abs_row, |b| b.start_row).is_ok()
+        self.blocks
+            .binary_search_by_key(&abs_row, |b| b.start_row)
+            .is_ok()
     }
 
     /// Block ID at the given row (for fold toggling).
@@ -198,16 +212,24 @@ impl BlockList {
     }
 
     /// Get the current (most recent) block.
-    pub fn current(&self) -> Option<&Block> { self.blocks.last() }
+    pub fn current(&self) -> Option<&Block> {
+        self.blocks.last()
+    }
 
     /// Whether OSC 133 shell integration is active (detected at least one marker).
-    pub fn has_osc133(&self) -> bool { self.has_osc133 }
+    pub fn has_osc133(&self) -> bool {
+        self.has_osc133
+    }
 
     /// All blocks.
-    pub fn blocks(&self) -> &[Block] { &self.blocks }
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
 
     /// Number of blocks.
-    pub fn len(&self) -> usize { self.blocks.len() }
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
 
     /// Total absolute rows hidden by folds.
     /// Each folded block uses 2 visual rows (block-start + summary); the rest are hidden.
@@ -219,7 +241,9 @@ impl BlockList {
     ) -> usize {
         let mut savings = 0;
         for (i, block) in self.blocks.iter().enumerate() {
-            if !folds.contains(&block.id) { continue; }
+            if !folds.contains(&block.id) {
+                continue;
+            }
             let end = self.block_end_row(i, total_rows);
             let clipped = if cursor_abs != usize::MAX && end > cursor_abs {
                 cursor_abs
@@ -227,7 +251,9 @@ impl BlockList {
                 end
             };
             let rows = clipped.saturating_sub(block.start_row);
-            if rows > 2 { savings += rows - 2; }
+            if rows > 2 {
+                savings += rows - 2;
+            }
         }
         savings
     }
@@ -243,20 +269,34 @@ impl BlockList {
         let mut vtotal: usize = 0;
         for (i, block) in self.blocks.iter().enumerate() {
             let end = self.block_end_row(i, total_rows);
-            let clipped = if cursor_abs != usize::MAX && end > cursor_abs { cursor_abs } else { end };
+            let clipped = if cursor_abs != usize::MAX && end > cursor_abs {
+                cursor_abs
+            } else {
+                end
+            };
             let n = clipped.saturating_sub(block.start_row);
-            vtotal += if folds.contains(&block.id) && n > 2 { 2 } else { n };
+            vtotal += if folds.contains(&block.id) && n > 2 {
+                2
+            } else {
+                n
+            };
         }
         // Rows after cursor clip (live input area, not folded)
         if cursor_abs != usize::MAX && !self.blocks.is_empty() {
             let li = self.blocks.len() - 1;
             let last_end = self.block_end_row(li, total_rows);
-            let clipped_end = if last_end > cursor_abs { cursor_abs } else { last_end };
+            let clipped_end = if last_end > cursor_abs {
+                cursor_abs
+            } else {
+                last_end
+            };
             if clipped_end < total_rows {
                 vtotal += total_rows - clipped_end;
             }
         }
-        if self.blocks.is_empty() { vtotal = total_rows; }
+        if self.blocks.is_empty() {
+            vtotal = total_rows;
+        }
         vtotal
     }
 
@@ -277,15 +317,27 @@ impl BlockList {
         let mut vrow: usize = 0;
         for (i, block) in self.blocks.iter().enumerate() {
             let end = self.block_end_row(i, total_rows);
-            let clipped = if cursor_abs != usize::MAX && end > cursor_abs { cursor_abs } else { end };
+            let clipped = if cursor_abs != usize::MAX && end > cursor_abs {
+                cursor_abs
+            } else {
+                end
+            };
             let abs_n = clipped.saturating_sub(block.start_row);
-            let vn = if folds.contains(&block.id) && abs_n > 2 { 2 } else { abs_n };
+            let vn = if folds.contains(&block.id) && abs_n > 2 {
+                2
+            } else {
+                abs_n
+            };
 
             if target_vrow < vrow + vn {
                 let offset = target_vrow - vrow;
                 if folds.contains(&block.id) && abs_n > 2 {
                     // Inside folded block: vrow 0 = block-start, vrow 1 = summary
-                    return if offset == 0 { block.start_row } else { block.start_row + 1 };
+                    return if offset == 0 {
+                        block.start_row
+                    } else {
+                        block.start_row + 1
+                    };
                 } else {
                     return block.start_row + offset;
                 }
@@ -296,7 +348,11 @@ impl BlockList {
         if !self.blocks.is_empty() {
             let li = self.blocks.len() - 1;
             let last_end = self.block_end_row(li, total_rows);
-            let clipped_end = if cursor_abs != usize::MAX && last_end > cursor_abs { cursor_abs } else { last_end };
+            let clipped_end = if cursor_abs != usize::MAX && last_end > cursor_abs {
+                cursor_abs
+            } else {
+                last_end
+            };
             return clipped_end + (target_vrow - vrow);
         }
         total_rows.saturating_sub(visible_rows + scroll_offset)
@@ -305,7 +361,12 @@ impl BlockList {
     /// Adjust start_rows when `n` lines are evicted from scrollback front.
     pub fn adjust_on_evict(&mut self, n: usize) {
         self.blocks.retain_mut(|b| {
-            if b.start_row < n { false } else { b.start_row -= n; true }
+            if b.start_row < n {
+                false
+            } else {
+                b.start_row -= n;
+                true
+            }
         });
     }
 }
@@ -410,7 +471,7 @@ impl Selection {
 }
 
 /// Saved state when switching to alternate screen buffer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AltScreenSaved {
     cells: Vec<Vec<Cell>>,
     scrollback: VecDeque<Vec<Cell>>,
@@ -434,8 +495,110 @@ pub struct SavedCursor {
     pub attrs: CellAttrs,
 }
 
+// ---------------------------------------------------------------------------
+// Damage tracking (per-row dirty-region bookkeeping for the renderer)
+// ---------------------------------------------------------------------------
+
+/// Inclusive column range of damage on a single grid row.
+///
+/// `damaged == false` means the row is clean and the renderer can keep its
+/// cached instance buffer for that row. When marked, `[left, right]` are the
+/// outer bounds of dirty cells (always clamped to `0..cols`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LineDamage {
+    pub damaged: bool,
+    pub left: u16,
+    pub right: u16,
+}
+
+impl LineDamage {
+    /// Extend the damage range to include `[left, right]`.
+    #[inline]
+    pub fn extend(&mut self, left: u16, right: u16) {
+        if !self.damaged {
+            self.damaged = true;
+            self.left = left;
+            self.right = right;
+        } else {
+            if left < self.left {
+                self.left = left;
+            }
+            if right > self.right {
+                self.right = right;
+            }
+        }
+    }
+
+    /// Reset to the undamaged state.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.damaged = false;
+        self.left = 0;
+        self.right = 0;
+    }
+}
+
+/// Aggregate damage state for a [`Grid`].
+///
+/// Inspired by Alacritty's `TermDamage`: callers iterate per-line bounds when
+/// rebuilding GPU instance buffers and skip clean rows entirely. `full` is the
+/// bail-out used when a single op invalidates everything (full clear, scroll,
+/// alt-screen swap, etc.).
+#[derive(Debug, Default, Clone)]
+pub struct Damage {
+    /// When true, every visible row is dirty regardless of `lines`.
+    pub full: bool,
+    /// Per-row damage, indexed by viewport row (length == `Grid::rows`).
+    pub lines: Vec<LineDamage>,
+    /// `true` iff cell *content* (chars / colors / attrs) was mutated since
+    /// the last `clear_damage`.  Selection-only damage added via
+    /// [`Grid::damage_selection_diff`] keeps this `false` so the renderer
+    /// can take the partial-rebuild fast path (only re-emit the rows whose
+    /// selection state changed) without worrying that some other thread
+    /// invalidated the cell-content cache underneath it.  Mirrors the
+    /// distinction Alacritty draws between `TermDamage` (cell content) and
+    /// `damage_tracker.damage_selection` (selection bounds only).
+    pub cells_dirty: bool,
+}
+
+impl Damage {
+    pub fn new(rows: usize) -> Self {
+        Self {
+            full: true,
+            lines: vec![LineDamage::default(); rows],
+            cells_dirty: true,
+        }
+    }
+
+    /// True when at least one row needs to be rebuilt.
+    #[inline]
+    pub fn is_damaged(&self) -> bool {
+        self.full || self.lines.iter().any(|l| l.damaged)
+    }
+
+    /// Iterate all damaged rows as `(row, left, right)` triples. When `full`
+    /// is set, returns every row spanning the full width.
+    pub fn iter_damaged<'a>(
+        &'a self,
+        cols: usize,
+    ) -> Box<dyn Iterator<Item = (usize, u16, u16)> + 'a> {
+        if self.full {
+            let last = cols.saturating_sub(1) as u16;
+            Box::new((0..self.lines.len()).map(move |r| (r, 0, last)))
+        } else {
+            Box::new(
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.damaged)
+                    .map(|(r, l)| (r, l.left, l.right)),
+            )
+        }
+    }
+}
+
 /// The terminal grid: `rows × cols` matrix of cells, plus a scrollback buffer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
@@ -484,8 +647,8 @@ pub struct Grid {
     /// Application keypad mode (DECNKM).
     pub application_keypad: bool,
     /// Mouse tracking modes
-    pub mouse_tracking: u16,   // 0=off, 1000=normal, 1002=button, 1003=any
-    pub mouse_format: u16,     // 0=default, 1006=SGR
+    pub mouse_tracking: u16, // 0=off, 1000=normal, 1002=button, 1003=any
+    pub mouse_format: u16, // 0=default, 1006=SGR
     /// Window title.
     pub title: String,
     /// Timestamp for each active screen row (parallel to `cells`).
@@ -498,6 +661,8 @@ pub struct Grid {
     pub scrollback_wrapped: VecDeque<bool>,
     /// Block list: ordered command blocks (Warp-inspired model).
     pub block_list: BlockList,
+    /// Per-frame damage state. Reset by the renderer once consumed.
+    pub damage: Damage,
 }
 
 impl Grid {
@@ -538,6 +703,160 @@ impl Grid {
                 bl.start_block(BlockTrigger::Initial, 0, [b'0'; 8]);
                 bl
             },
+            damage: Damage::new(rows),
+        }
+    }
+
+    // ---- Damage helpers ----
+
+    /// Mark `[left, right]` of the visible row `row` as needing redraw.
+    /// Indices outside the grid are silently clamped/ignored.
+    ///
+    /// Sets `damage.cells_dirty=true`: this entry-point is reserved for
+    /// callers that actually mutated cell content.  Selection / cursor /
+    /// blink-only invalidations must go through
+    /// [`Grid::damage_selection_diff`] instead so the renderer can keep
+    /// the partial-rebuild fast path.
+    #[inline]
+    pub fn damage_line(&mut self, row: usize, left: usize, right: usize) {
+        self.damage.cells_dirty = true;
+        if self.damage.full || self.cols == 0 || row >= self.damage.lines.len() {
+            return;
+        }
+        let last = (self.cols - 1) as u16;
+        let l = (left as u16).min(last);
+        let r = (right as u16).min(last);
+        if r < l {
+            return;
+        }
+        self.damage.lines[row].extend(l, r);
+    }
+
+    /// Damage a full row.
+    #[inline]
+    pub fn damage_row(&mut self, row: usize) {
+        if self.cols == 0 {
+            return;
+        }
+        self.damage_line(row, 0, self.cols - 1);
+    }
+
+    /// Mark every visible row as damaged.
+    #[inline]
+    pub fn damage_full(&mut self) {
+        self.damage.full = true;
+        self.damage.cells_dirty = true;
+    }
+
+    /// True iff at least one row needs to be rebuilt.
+    #[inline]
+    pub fn is_damaged(&self) -> bool {
+        self.damage.is_damaged()
+    }
+
+    /// Snapshot the current damage and reset it. The renderer should call this
+    /// once per frame after consuming damage info.
+    pub fn take_damage(&mut self) -> Damage {
+        let mut new = Damage {
+            full: false,
+            lines: vec![LineDamage::default(); self.rows],
+            cells_dirty: false,
+        };
+        std::mem::swap(&mut new, &mut self.damage);
+        new
+    }
+
+    /// Reset the damage state without producing a snapshot. Renderers that
+    /// always rebuild can use this after consuming the grid.
+    #[inline]
+    pub fn clear_damage(&mut self) {
+        self.damage.full = false;
+        for l in &mut self.damage.lines {
+            l.reset();
+        }
+        self.damage.cells_dirty = false;
+    }
+
+    /// Damage the rows whose selection-membership flipped between `old` and
+    /// `new`.  Used by the input layer to tell the renderer "the selection
+    /// moved, but no cells were touched", enabling the Alacritty-style
+    /// partial-rebuild path.  Crucially, this writes to `damage.lines`
+    /// **without** setting `damage.cells_dirty`, which is what lets the
+    /// renderer distinguish a pure selection move from a real cell write
+    /// (PTY output, cursor blink overwrite, etc.).
+    ///
+    /// Algorithm matches `display::damage::damage_selection` from upstream
+    /// Alacritty: damage the union of (old selection's anchor + cursor
+    /// rows) ∪ (new selection's anchor + cursor rows) ∪ (rows whose
+    /// membership in the selection range changed).  This conservative
+    /// superset is at most three rows for the common "cursor moves by one
+    /// cell during a drag" case, and is bounded by `|old△new|` for
+    /// arbitrary jumps.
+    pub fn damage_selection_diff(
+        &mut self,
+        old: Option<Selection>,
+        new: Option<Selection>,
+    ) {
+        if old == new || self.cols == 0 || self.damage.lines.is_empty() {
+            return;
+        }
+        let cols_last = (self.cols - 1) as u16;
+        let viewport_start = self.viewport_start();
+        let viewport_end = viewport_start + self.rows;
+        let lines = &mut self.damage.lines;
+
+        let mark = |abs_row: usize, lines: &mut [LineDamage]| {
+            if abs_row >= viewport_start && abs_row < viewport_end {
+                let v_row = abs_row - viewport_start;
+                if v_row < lines.len() {
+                    lines[v_row].extend(0, cols_last);
+                }
+            }
+        };
+
+        // Boundary rows of both endpoints.  These cover the "same row,
+        // column moved within row" case (e.g. drag end hopping from
+        // col 12 → col 13 on the same row) which is otherwise invisible
+        // to a pure range-membership XOR.
+        if let Some(o) = old {
+            let (r0, _, r1, _) = o.ordered();
+            mark(r0, lines);
+            mark(r1, lines);
+        }
+        if let Some(n) = new {
+            let (r0, _, r1, _) = n.ordered();
+            mark(r0, lines);
+            mark(r1, lines);
+        }
+
+        // Range-membership XOR: rows that gained or lost selection.
+        match (old, new) {
+            (Some(o), Some(n)) => {
+                let (oa, _, ob, _) = o.ordered();
+                let (na, _, nb, _) = n.ordered();
+                let lo = oa.min(na);
+                let hi = ob.max(nb);
+                for r in lo..=hi {
+                    let in_old = r >= oa && r <= ob;
+                    let in_new = r >= na && r <= nb;
+                    if in_old != in_new {
+                        mark(r, lines);
+                    }
+                }
+            }
+            (Some(o), None) => {
+                let (oa, _, ob, _) = o.ordered();
+                for r in oa..=ob {
+                    mark(r, lines);
+                }
+            }
+            (None, Some(n)) => {
+                let (na, _, nb, _) = n.ordered();
+                for r in na..=nb {
+                    mark(r, lines);
+                }
+            }
+            (None, None) => {}
         }
     }
 
@@ -558,6 +877,10 @@ impl Grid {
         if self.cursor_col >= new_cols {
             self.cursor_col = new_cols.saturating_sub(1);
         }
+        // Resize damage tracking and mark fully damaged — every cell may have
+        // shifted, scrolled, or been re-coloured by reflow.
+        self.damage.lines.resize(new_rows, LineDamage::default());
+        self.damage.full = true;
     }
 
     /// Scroll the visible buffer up by one line, respecting scroll region.
@@ -573,6 +896,7 @@ impl Grid {
 
     /// Scroll up within the current scroll region by `n` lines.
     pub fn scroll_up_n_in_region(&mut self, n: usize) {
+        self.damage_full();
         let top = self.scroll_top;
         let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
         if top >= self.cells.len() || bot >= self.cells.len() || top > bot {
@@ -580,7 +904,9 @@ impl Grid {
         }
         let region = bot - top + 1;
         let n = n.min(region);
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
 
         self.cells[top..=bot].rotate_left(n);
         // Keep timestamps and wrap flags in lock-step with cells.
@@ -612,14 +938,19 @@ impl Grid {
                 let top_row = std::mem::replace(&mut self.cells[i], blank);
                 self.scrollback.push_back(top_row);
                 // Use the active row's timestamp if available, otherwise now
-                let row_ts = if i < self.active_timestamps.len() && self.active_timestamps[i] != [b'0'; 8] {
-                    self.active_timestamps[i]
-                } else {
-                    now_ts
-                };
+                let row_ts =
+                    if i < self.active_timestamps.len() && self.active_timestamps[i] != [b'0'; 8] {
+                        self.active_timestamps[i]
+                    } else {
+                        now_ts
+                    };
                 self.scrollback_timestamps.push_back(row_ts);
                 // Carry wrap flag to scrollback, then reset
-                let was_wrapped = if i < self.line_wrapped.len() { self.line_wrapped[i] } else { false };
+                let was_wrapped = if i < self.line_wrapped.len() {
+                    self.line_wrapped[i]
+                } else {
+                    false
+                };
                 self.scrollback_wrapped.push_back(was_wrapped);
                 // Reset the active timestamp and wrap flag for the now-blank row
                 if i < self.active_timestamps.len() {
@@ -640,6 +971,7 @@ impl Grid {
 
     /// Scroll down within the current scroll region by `n` lines.
     pub fn scroll_down_n_in_region(&mut self, n: usize) {
+        self.damage_full();
         let top = self.scroll_top;
         let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
         if top >= self.cells.len() || bot >= self.cells.len() || top > bot {
@@ -647,7 +979,9 @@ impl Grid {
         }
         let region = bot - top + 1;
         let n = n.min(region);
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
 
         self.cells[top..=bot].rotate_right(n);
         if bot < self.active_timestamps.len() {
@@ -660,7 +994,9 @@ impl Grid {
         for r in top..top + n {
             self.cells[r].fill(Cell::default());
             self.reset_row_timestamp(r);
-            if r < self.line_wrapped.len() { self.line_wrapped[r] = false; }
+            if r < self.line_wrapped.len() {
+                self.line_wrapped[r] = false;
+            }
         }
     }
 
@@ -674,6 +1010,7 @@ impl Grid {
         if self.is_alt_screen {
             return;
         }
+        self.damage_full();
         let saved = AltScreenSaved {
             cells: std::mem::replace(
                 &mut self.cells,
@@ -682,7 +1019,10 @@ impl Grid {
             scrollback: std::mem::take(&mut self.scrollback),
             scrollback_timestamps: std::mem::take(&mut self.scrollback_timestamps),
             scrollback_wrapped: std::mem::take(&mut self.scrollback_wrapped),
-            active_timestamps: std::mem::replace(&mut self.active_timestamps, vec![[b'0'; 8]; self.rows]),
+            active_timestamps: std::mem::replace(
+                &mut self.active_timestamps,
+                vec![[b'0'; 8]; self.rows],
+            ),
             line_wrapped: std::mem::replace(&mut self.line_wrapped, vec![false; self.rows]),
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
@@ -702,6 +1042,7 @@ impl Grid {
         if !self.is_alt_screen {
             return;
         }
+        self.damage_full();
         if let Some(saved) = self.alt_screen_saved.take() {
             self.cells = saved.cells;
             self.scrollback = saved.scrollback;
@@ -720,17 +1061,28 @@ impl Grid {
     /// Scroll viewport up (into history) by `lines` lines.
     pub fn scroll_viewport_up(&mut self, lines: usize) {
         let max = self.scrollback.len();
-        self.scroll_offset = (self.scroll_offset + lines).min(max);
+        let new = (self.scroll_offset + lines).min(max);
+        if new != self.scroll_offset {
+            self.scroll_offset = new;
+            self.damage_full();
+        }
     }
 
     /// Scroll viewport down (toward live) by `lines` lines.
     pub fn scroll_viewport_down(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        let new = self.scroll_offset.saturating_sub(lines);
+        if new != self.scroll_offset {
+            self.scroll_offset = new;
+            self.damage_full();
+        }
     }
 
     /// Reset viewport to live (bottom).
     pub fn scroll_reset(&mut self) {
-        self.scroll_offset = 0;
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+            self.damage_full();
+        }
     }
 
     /// Convert a viewport row (0 = top of screen) to an absolute row index.
@@ -804,7 +1156,9 @@ impl Grid {
             self.scrollback_timestamps.get(abs_row)
         } else {
             let screen_row = abs_row - sb_len;
-            self.active_timestamps.get(screen_row).filter(|ts| **ts != [b'0'; 8])
+            self.active_timestamps
+                .get(screen_row)
+                .filter(|ts| **ts != [b'0'; 8])
         }
     }
 
@@ -863,7 +1217,10 @@ impl Grid {
     fn raw_wrap_flag(&self, abs_row: usize) -> bool {
         let sb = self.scrollback.len();
         if abs_row < sb {
-            self.scrollback_wrapped.get(abs_row).copied().unwrap_or(false)
+            self.scrollback_wrapped
+                .get(abs_row)
+                .copied()
+                .unwrap_or(false)
         } else {
             let screen_row = abs_row - sb;
             self.line_wrapped.get(screen_row).copied().unwrap_or(false)
@@ -872,7 +1229,9 @@ impl Grid {
 
     /// Check if the previous row's last column is non-blank (i.e. it overflowed).
     fn prev_row_fills_last_col(&self, abs_row: usize) -> bool {
-        if abs_row == 0 { return false; }
+        if abs_row == 0 {
+            return false;
+        }
         self.absolute_row(abs_row - 1)
             .and_then(|prev| prev.last())
             .map(|c| c.ch != ' ' && c.ch != '\0')
@@ -928,10 +1287,13 @@ impl Grid {
         let mut lines = Vec::new();
         for (i, r) in (block.start_row..block.start_row + max_rows).enumerate() {
             if let Some(text) = self.row_text_at(r) {
-                if text.is_empty() { break; }
+                if text.is_empty() {
+                    break;
+                }
                 // First row: skip prompt prefix up to cmd_col
                 let line = if i == 0 && cmd_col > 0 {
-                    let char_idx = text.char_indices()
+                    let char_idx = text
+                        .char_indices()
                         .nth(cmd_col)
                         .map(|(idx, _)| idx)
                         .unwrap_or(text.len());
@@ -979,7 +1341,9 @@ impl Grid {
     ) -> usize {
         let total = self.total_rows();
         let cursor_abs = self.scrollback.len() + self.cursor_row;
-        let mut abs = self.block_list.render_start(folds, total, cursor_abs, self.rows, self.scroll_offset);
+        let mut abs =
+            self.block_list
+                .render_start(folds, total, cursor_abs, self.rows, self.scroll_offset);
         let mut vis: usize = 0;
 
         while vis < target_visual && abs < total {
@@ -993,7 +1357,9 @@ impl Grid {
                 if let Some((bi, blk)) = self.block_list.block_for_row(abs) {
                     if folds.contains(&blk.id) {
                         let mut end = self.block_list.block_end_row(bi, total);
-                        if end > cursor_abs { end = cursor_abs; }
+                        if end > cursor_abs {
+                            end = cursor_abs;
+                        }
                         let count = end.saturating_sub(abs);
                         if count > 0 {
                             vis += 1; // summary line occupies 1 visual row
@@ -1079,8 +1445,8 @@ impl Grid {
                     let mlen = needle.len();
 
                     if whole_word {
-                        let before_ok = col == 0
-                            || !haystack.as_bytes()[col - 1].is_ascii_alphanumeric();
+                        let before_ok =
+                            col == 0 || !haystack.as_bytes()[col - 1].is_ascii_alphanumeric();
                         let after_ok = col + mlen >= haystack.len()
                             || !haystack.as_bytes()[col + mlen].is_ascii_alphanumeric();
                         if before_ok && after_ok {
@@ -1094,5 +1460,130 @@ impl Grid {
             }
         }
         results
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+
+    #[test]
+    fn new_grid_is_fully_damaged() {
+        let g = Grid::new(10, 5, 100);
+        assert!(g.is_damaged());
+        assert!(g.damage.full);
+    }
+
+    #[test]
+    fn clear_damage_marks_clean() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        assert!(!g.is_damaged());
+        assert!(!g.damage.full);
+    }
+
+    #[test]
+    fn damage_line_extends_range() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        g.damage_line(2, 3, 5);
+        assert!(g.is_damaged());
+        let d = &g.damage.lines[2];
+        assert!(d.damaged);
+        assert_eq!(d.left, 3);
+        assert_eq!(d.right, 5);
+
+        // Extend to include col 7 — left stays, right grows.
+        g.damage_line(2, 6, 7);
+        let d = &g.damage.lines[2];
+        assert_eq!(d.left, 3);
+        assert_eq!(d.right, 7);
+
+        // Extend to include col 1 — left shrinks, right stays.
+        g.damage_line(2, 1, 2);
+        let d = &g.damage.lines[2];
+        assert_eq!(d.left, 1);
+        assert_eq!(d.right, 7);
+    }
+
+    #[test]
+    fn damage_line_clamps_out_of_range() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        g.damage_line(2, 5, 100);
+        let d = &g.damage.lines[2];
+        assert_eq!(d.right, 9); // clamped to cols - 1
+    }
+
+    #[test]
+    fn damage_full_overrides_per_line() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        g.damage_line(1, 0, 3);
+        g.damage_full();
+        assert!(g.damage.full);
+        // is_damaged() still true
+        assert!(g.is_damaged());
+    }
+
+    #[test]
+    fn resize_marks_fully_damaged() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        g.resize(20, 10);
+        assert!(g.damage.full);
+        assert_eq!(g.damage.lines.len(), 10);
+    }
+
+    #[test]
+    fn take_damage_returns_and_resets() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        g.damage_line(3, 2, 4);
+        let taken = g.take_damage();
+        assert!(taken.lines[3].damaged);
+        assert!(!g.is_damaged());
+    }
+
+    #[test]
+    fn iter_damaged_yields_only_dirty_rows() {
+        let mut g = Grid::new(8, 4, 100);
+        g.clear_damage();
+        g.damage_line(0, 1, 2);
+        g.damage_line(2, 0, 5);
+        let dirty: Vec<_> = g.damage.iter_damaged(g.cols).collect();
+        assert_eq!(dirty, vec![(0, 1, 2), (2, 0, 5)]);
+    }
+
+    #[test]
+    fn iter_damaged_full_spans_all_rows() {
+        let g = Grid::new(8, 4, 100);
+        // New grid is fully damaged.
+        let dirty: Vec<_> = g.damage.iter_damaged(g.cols).collect();
+        assert_eq!(dirty.len(), 4);
+        for (i, row) in dirty.iter().enumerate() {
+            assert_eq!(row.0, i);
+            assert_eq!(row.1, 0);
+            assert_eq!(row.2, 7);
+        }
+    }
+
+    #[test]
+    fn scroll_viewport_no_op_keeps_clean() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        g.scroll_viewport_up(1); // scrollback empty → no change
+        assert!(!g.is_damaged());
+    }
+
+    #[test]
+    fn alt_screen_swap_marks_full() {
+        let mut g = Grid::new(10, 5, 100);
+        g.clear_damage();
+        g.enter_alt_screen();
+        assert!(g.damage.full);
+        g.clear_damage();
+        g.leave_alt_screen();
+        assert!(g.damage.full);
     }
 }

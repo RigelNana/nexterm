@@ -1,14 +1,18 @@
 //! SSH backend: bridges async russh channel I/O to sync mpsc for the pane system.
 
+use crate::Waker;
 use nexterm_sftp::RemoteEntry;
-use nexterm_ssh::connection::SshConnection;
 use nexterm_ssh::SshProfile;
+use nexterm_ssh::connection::{ClientHandler, SshConnection};
 use russh::ChannelMsg;
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Instant;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, watch};
 use tracing::{error, info, warn};
+
+/// Alias for the shareable russh client handle exposed through [`SshSession`].
+pub type SharedSshHandle = Arc<russh::client::Handle<ClientHandler>>;
 
 /// SFTP command sent from UI to the SSH background task.
 #[derive(Debug)]
@@ -22,9 +26,15 @@ pub enum SftpCommand {
     /// Create an empty file (touch) at the given path, then refresh listing.
     Touch(String),
     /// Download a remote file to a local path.
-    Download { remote_path: String, local_path: String },
+    Download {
+        remote_path: String,
+        local_path: String,
+    },
     /// Upload a local file to a remote path.
-    Upload { local_path: String, remote_path: String },
+    Upload {
+        local_path: String,
+        remote_path: String,
+    },
 }
 
 /// Direction of an in-flight transfer.
@@ -38,13 +48,22 @@ pub enum TransferDir {
 #[derive(Debug, Clone)]
 pub enum SftpResult {
     /// Directory listing result: (current_path, entries).
-    DirListing { path: String, entries: Vec<RemoteEntry> },
+    DirListing {
+        path: String,
+        entries: Vec<RemoteEntry>,
+    },
     /// Error message.
     Error(String),
     /// Download completed.
-    DownloadDone { remote_path: String, local_path: String },
+    DownloadDone {
+        remote_path: String,
+        local_path: String,
+    },
     /// Upload completed.
-    UploadDone { local_path: String, remote_path: String },
+    UploadDone {
+        local_path: String,
+        remote_path: String,
+    },
     /// Progress update for an in-flight transfer. `key` is the remote_path,
     /// used by the UI to look up the corresponding job.
     TransferProgress {
@@ -177,6 +196,11 @@ pub struct SshSession {
     pub status: Arc<Mutex<ServerStatus>>,
     /// Receive SFTP results (directory listings, errors).
     pub sftp_result_rx: std_mpsc::Receiver<SftpResult>,
+    /// Latest-value cell for the russh client handle. `None` until
+    /// authentication completes; `Some(handle)` afterwards. Stays `Some`
+    /// until the task exits. Other subsystems (Docker backend, port
+    /// forwarding) borrow a clone of the handle from here.
+    pub ssh_handle: watch::Receiver<Option<SharedSshHandle>>,
 }
 
 impl SshSession {
@@ -194,6 +218,12 @@ impl SshSession {
     pub fn sftp_command(&self, cmd: SftpCommand) {
         let _ = self.sftp_cmd_tx.send(cmd);
     }
+
+    /// Get a clone of the russh handle, if the session has finished
+    /// authenticating. Cheap — the handle is refcounted.
+    pub fn ssh_handle(&self) -> Option<SharedSshHandle> {
+        self.ssh_handle.borrow().clone()
+    }
 }
 
 /// Spawn an SSH pane session on the given tokio runtime.
@@ -203,12 +233,14 @@ pub fn spawn_ssh_pane(
     profile: SshProfile,
     cols: u16,
     rows: u16,
+    waker: Waker,
 ) -> (std_mpsc::Receiver<Vec<u8>>, SshSession) {
     let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
     let (write_tx, write_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
     let (resize_tx, resize_rx) = tokio_mpsc::unbounded_channel::<(u16, u16)>();
     let (sftp_cmd_tx, sftp_cmd_rx) = tokio_mpsc::unbounded_channel::<SftpCommand>();
     let (sftp_result_tx, sftp_result_rx) = std_mpsc::channel::<SftpResult>();
+    let (handle_tx, handle_rx) = watch::channel::<Option<SharedSshHandle>>(None);
     let status = Arc::new(Mutex::new(ServerStatus::default()));
 
     rt.spawn(ssh_task(
@@ -221,6 +253,8 @@ pub fn spawn_ssh_pane(
         Arc::clone(&status),
         sftp_cmd_rx,
         sftp_result_tx,
+        handle_tx,
+        waker,
     ));
 
     let session = SshSession {
@@ -229,6 +263,7 @@ pub fn spawn_ssh_pane(
         sftp_cmd_tx,
         status,
         sftp_result_rx,
+        ssh_handle: handle_rx,
     };
     (output_rx, session)
 }
@@ -262,11 +297,18 @@ fn parse_status_output(raw: &str, latency_ms: u32, connected_at: Instant) -> Ser
         } else if let Some(val) = line.strip_prefix("UPTIME:") {
             let trimmed = val.trim().to_string();
             if let Some(load_pos) = trimmed.find("load average") {
-                s.load_avg = trimmed[load_pos..].replace("load average: ", "").replace("load average:", "").trim().to_string();
+                s.load_avg = trimmed[load_pos..]
+                    .replace("load average: ", "")
+                    .replace("load average:", "")
+                    .trim()
+                    .to_string();
             }
             if let Some(up_pos) = trimmed.find("up ") {
                 let after_up = &trimmed[up_pos + 3..];
-                let end = after_up.find(" user").or_else(|| after_up.find("load")).unwrap_or(after_up.len());
+                let end = after_up
+                    .find(" user")
+                    .or_else(|| after_up.find("load"))
+                    .unwrap_or(after_up.len());
                 let raw_up = after_up[..end].trim().trim_end_matches(',').trim();
                 s.uptime = raw_up.to_string();
             } else {
@@ -286,7 +328,11 @@ fn parse_status_output(raw: &str, latency_ms: u32, connected_at: Instant) -> Ser
                 s.cpu_usage_pct = {
                     let total: f32 = parts[0].trim().parse().unwrap_or(0.0);
                     let idle: f32 = parts[1].trim().parse().unwrap_or(0.0);
-                    if total > 0.0 { (1.0 - idle / total) * 100.0 } else { 0.0 }
+                    if total > 0.0 {
+                        (1.0 - idle / total) * 100.0
+                    } else {
+                        0.0
+                    }
                 };
             }
         } else if let Some(val) = line.strip_prefix("DF:") {
@@ -329,8 +375,16 @@ fn parse_status_output(raw: &str, latency_ms: u32, connected_at: Instant) -> Ser
                 let name = parts[0].rsplit('/').next().unwrap_or(parts[0]).to_string();
                 let cpu_pct: f32 = parts[1].trim().parse().unwrap_or(0.0);
                 let mem_str = parts[2].trim().to_string();
-                let mem_kb: u64 = parts.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-                s.top_procs.push(ProcessInfo { name, cpu_pct, mem_str, mem_kb });
+                let mem_kb: u64 = parts
+                    .get(3)
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+                s.top_procs.push(ProcessInfo {
+                    name,
+                    cpu_pct,
+                    mem_str,
+                    mem_kb,
+                });
             }
         } else if line.starts_with("DISK:") {
             // Legacy fallback
@@ -360,10 +414,13 @@ fn compute_net_rates(
             let dtx = c.tx_bytes.saturating_sub(p.tx_bytes);
             total_rx += drx;
             total_tx += dtx;
-            per_if.push((c.name.clone(), NetRateSample {
-                rx_bps: drx as f64 / interval_secs,
-                tx_bps: dtx as f64 / interval_secs,
-            }));
+            per_if.push((
+                c.name.clone(),
+                NetRateSample {
+                    rx_bps: drx as f64 / interval_secs,
+                    tx_bps: dtx as f64 / interval_secs,
+                },
+            ));
         }
     }
     (
@@ -383,7 +440,11 @@ async fn probe_server_status(
     // Measure true round-trip latency with a lightweight echo
     let ping_start = Instant::now();
     let ping_ok = conn.exec_command("echo ok").await.is_ok();
-    let latency_ms = if ping_ok { ping_start.elapsed().as_millis() as u32 } else { 0 };
+    let latency_ms = if ping_ok {
+        ping_start.elapsed().as_millis() as u32
+    } else {
+        0
+    };
 
     match conn.exec_command(STATUS_PROBE_CMD).await {
         Ok(output) => {
@@ -428,10 +489,7 @@ async fn probe_server_status(
 }
 
 /// List a remote directory via SFTP and return an SftpResult.
-async fn sftp_list_dir_impl(
-    sftp: &russh_sftp::client::SftpSession,
-    path: &str,
-) -> SftpResult {
+async fn sftp_list_dir_impl(sftp: &russh_sftp::client::SftpSession, path: &str) -> SftpResult {
     match sftp.read_dir(path).await {
         Ok(read_dir) => {
             let mut entries: Vec<RemoteEntry> = Vec::new();
@@ -442,7 +500,7 @@ async fn sftp_list_dir_impl(
                 }
                 let meta: russh_sftp::protocol::FileAttributes = entry.metadata();
                 let perms = meta.permissions.unwrap_or(0);
-                let is_dir = perms & 0o40000 != 0;  // S_IFDIR
+                let is_dir = perms & 0o40000 != 0; // S_IFDIR
                 let is_symlink = perms & 0o120000 == 0o120000; // S_IFLNK
                 let file_type = if is_symlink {
                     "link".to_string()
@@ -465,17 +523,21 @@ async fn sftp_list_dir_impl(
                     permissions: meta.permissions.unwrap_or(0),
                     modified: meta.mtime.unwrap_or(0) as u64,
                     file_type,
-                    owner: meta.user.clone().unwrap_or_else(|| {
-                        meta.uid.map(|u| u.to_string()).unwrap_or_default()
-                    }),
-                    group: meta.group.clone().unwrap_or_else(|| {
-                        meta.gid.map(|g| g.to_string()).unwrap_or_default()
-                    }),
+                    owner: meta
+                        .user
+                        .clone()
+                        .unwrap_or_else(|| meta.uid.map(|u| u.to_string()).unwrap_or_default()),
+                    group: meta
+                        .group
+                        .clone()
+                        .unwrap_or_else(|| meta.gid.map(|g| g.to_string()).unwrap_or_default()),
                 });
             }
             // Sort: directories first, then alphabetically
             entries.sort_by(|a, b| {
-                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             });
             SftpResult::DirListing {
                 path: path.to_string(),
@@ -498,7 +560,10 @@ async fn sftp_download_impl(
 ) -> Result<(), String> {
     use tokio::io::AsyncReadExt;
 
-    let mut remote_file = sftp.open(remote_path).await.map_err(|e| format!("open: {e}"))?;
+    let mut remote_file = sftp
+        .open(remote_path)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
     // Determine total size for progress reporting.
     let total = remote_file
         .metadata()
@@ -526,7 +591,9 @@ async fn sftp_download_impl(
         if n == 0 {
             break;
         }
-        local.write_all(&buf[..n]).map_err(|e| format!("write local: {e}"))?;
+        local
+            .write_all(&buf[..n])
+            .map_err(|e| format!("write local: {e}"))?;
         transferred += n as u64;
         let _ = progress_tx.send(SftpResult::TransferProgress {
             dir: TransferDir::Download,
@@ -535,7 +602,10 @@ async fn sftp_download_impl(
             total,
         });
     }
-    info!("Downloaded {} → {} ({} bytes)", remote_path, local_path, transferred);
+    info!(
+        "Downloaded {} → {} ({} bytes)",
+        remote_path, local_path, transferred
+    );
     Ok(())
 }
 
@@ -548,9 +618,7 @@ async fn sftp_upload_impl(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let total = std::fs::metadata(local_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let total = std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
     let mut local = std::fs::File::open(local_path).map_err(|e| format!("open local: {e}"))?;
     let mut remote_file = sftp
         .create(remote_path)
@@ -567,7 +635,9 @@ async fn sftp_upload_impl(
         total,
     });
     loop {
-        let n = local.read(&mut buf).map_err(|e| format!("read local: {e}"))?;
+        let n = local
+            .read(&mut buf)
+            .map_err(|e| format!("read local: {e}"))?;
         if n == 0 {
             break;
         }
@@ -587,7 +657,10 @@ async fn sftp_upload_impl(
         .flush()
         .await
         .map_err(|e| format!("flush remote: {e}"))?;
-    info!("Uploaded {} → {} ({} bytes)", local_path, remote_path, transferred);
+    info!(
+        "Uploaded {} → {} ({} bytes)",
+        local_path, remote_path, transferred
+    );
     Ok(())
 }
 
@@ -595,12 +668,15 @@ async fn ssh_task(
     profile: SshProfile,
     cols: u16,
     rows: u16,
+    // Output sender + reader follow; waker is the last positional arg.
     output_tx: std_mpsc::Sender<Vec<u8>>,
     mut write_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
     mut resize_rx: tokio_mpsc::UnboundedReceiver<(u16, u16)>,
     status: Arc<Mutex<ServerStatus>>,
     mut sftp_cmd_rx: tokio_mpsc::UnboundedReceiver<SftpCommand>,
     sftp_result_tx: std_mpsc::Sender<SftpResult>,
+    handle_tx: watch::Sender<Option<SharedSshHandle>>,
+    waker: Waker,
 ) {
     let host = profile.host.clone();
     let user = profile.username.clone();
@@ -611,9 +687,14 @@ async fn ssh_task(
         Err(e) => {
             let msg = format!("\x1b[31mSSH connection failed: {e}\x1b[0m\r\n");
             let _ = output_tx.send(msg.into_bytes());
+            waker();
             return;
         }
     };
+
+    // Publish the russh handle so subsystems (Docker backend, port forwarding,
+    // etc.) can open additional channels on this session.
+    let _ = handle_tx.send(conn.clone_handle());
 
     let connected_at = Instant::now();
     {
@@ -629,6 +710,7 @@ async fn ssh_task(
         Err(e) => {
             let msg = format!("\x1b[31mFailed to open remote shell: {e}\x1b[0m\r\n");
             let _ = output_tx.send(msg.into_bytes());
+            waker();
             return;
         }
     };
@@ -675,6 +757,7 @@ async fn ssh_task(
                                     // Forward the rest (clear screen output + prompt)
                                     if start < buf.len() {
                                         let _ = output_tx.send(buf[start..].to_vec());
+                                        waker();
                                     }
                                     break;
                                 }
@@ -690,6 +773,7 @@ async fn ssh_task(
                         warn!(host = %host, "sentinel timeout, forwarding buffered output");
                         if !buf.is_empty() {
                             let _ = output_tx.send(buf);
+                            waker();
                         }
                         break;
                     }
@@ -752,20 +836,24 @@ async fn ssh_task(
                         if output_tx.send(data.to_vec()).is_err() {
                             break; // pane dropped
                         }
+                        waker();
                     }
                     Some(ChannelMsg::ExtendedData { ref data, .. }) => {
                         if output_tx.send(data.to_vec()).is_err() {
                             break;
                         }
+                        waker();
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         let msg = format!("\r\n\x1b[33m[Process exited with status {exit_status}]\x1b[0m\r\n");
                         let _ = output_tx.send(msg.into_bytes());
+                        waker();
                         break;
                     }
                     Some(ChannelMsg::Eof) | None => {
                         let msg = b"\r\n\x1b[33m[Connection closed]\x1b[0m\r\n".to_vec();
                         let _ = output_tx.send(msg);
+                        waker();
                         break;
                     }
                     _ => {}

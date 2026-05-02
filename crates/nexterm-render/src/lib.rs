@@ -9,6 +9,7 @@
 //! - 60 FPS+ with dirty-region tracking
 
 pub mod atlas;
+pub mod builtin_font;
 pub mod gui;
 pub mod pipeline;
 pub mod renderer;

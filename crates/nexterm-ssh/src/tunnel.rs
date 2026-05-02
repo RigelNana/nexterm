@@ -18,9 +18,7 @@ pub enum TunnelType {
         local_port: u16,
     },
     /// -D local_port (SOCKS5 proxy)
-    DynamicForward {
-        local_port: u16,
-    },
+    DynamicForward { local_port: u16 },
 }
 
 /// A configured tunnel template.

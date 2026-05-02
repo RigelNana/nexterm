@@ -100,11 +100,16 @@ impl HistoryDb {
         let entries = stmt
             .query_map(rusqlite::params![query, limit as i64], |row| {
                 Ok(HistoryEntry {
-                    id: row.get::<_, String>(0).map(|s| Uuid::parse_str(&s).unwrap_or_default()).unwrap_or_default(),
+                    id: row
+                        .get::<_, String>(0)
+                        .map(|s| Uuid::parse_str(&s).unwrap_or_default())
+                        .unwrap_or_default(),
                     command: row.get(1)?,
                     output_summary: row.get(2)?,
                     exit_code: row.get(3)?,
-                    session_id: row.get::<_, Option<String>>(4)?.map(|s| Uuid::parse_str(&s).unwrap_or_default()),
+                    session_id: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|s| Uuid::parse_str(&s).unwrap_or_default()),
                     host: row.get(5)?,
                     cwd: row.get(6)?,
                     timestamp: row.get(7)?,
@@ -127,11 +132,16 @@ impl HistoryDb {
         let entries = stmt
             .query_map(rusqlite::params![limit as i64], |row| {
                 Ok(HistoryEntry {
-                    id: row.get::<_, String>(0).map(|s| Uuid::parse_str(&s).unwrap_or_default()).unwrap_or_default(),
+                    id: row
+                        .get::<_, String>(0)
+                        .map(|s| Uuid::parse_str(&s).unwrap_or_default())
+                        .unwrap_or_default(),
                     command: row.get(1)?,
                     output_summary: row.get(2)?,
                     exit_code: row.get(3)?,
-                    session_id: row.get::<_, Option<String>>(4)?.map(|s| Uuid::parse_str(&s).unwrap_or_default()),
+                    session_id: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|s| Uuid::parse_str(&s).unwrap_or_default()),
                     host: row.get(5)?,
                     cwd: row.get(6)?,
                     timestamp: row.get(7)?,
@@ -144,9 +154,9 @@ impl HistoryDb {
 
     /// Count total history entries.
     pub fn count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM history", [], |row| row.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 }

@@ -1,8 +1,11 @@
 //! Tab and layout management: tabs contain a layout tree of split panes.
 
+use crate::Waker;
 use crate::pane::{Pane, Rect};
+use nexterm_docker::DockerBackend;
 use nexterm_ssh::SshProfile;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tracing::info;
 
@@ -185,9 +188,16 @@ impl TabManager {
     }
 
     /// Create a new tab with a single pane. Returns the tab index.
-    pub fn new_tab(&mut self, viewport: Rect, cell_w: f32, cell_h: f32, shell: Option<&str>) -> anyhow::Result<usize> {
+    pub fn new_tab(
+        &mut self,
+        viewport: Rect,
+        cell_w: f32,
+        cell_h: f32,
+        shell: Option<&str>,
+        waker: Waker,
+    ) -> anyhow::Result<usize> {
         let pane_id = self.alloc_pane_id();
-        let pane = Pane::new(pane_id, viewport, cell_w, cell_h, shell)?;
+        let pane = Pane::new(pane_id, viewport, cell_w, cell_h, shell, waker)?;
         self.panes.insert(pane_id, pane);
 
         let tab = Tab {
@@ -210,10 +220,11 @@ impl TabManager {
         cell_h: f32,
         profile: SshProfile,
         rt: &Runtime,
+        waker: Waker,
     ) -> usize {
         let pane_id = self.alloc_pane_id();
         let host = profile.host.clone();
-        let pane = Pane::new_ssh(pane_id, viewport, cell_w, cell_h, profile, rt);
+        let pane = Pane::new_ssh(pane_id, viewport, cell_w, cell_h, profile, rt, waker);
         self.panes.insert(pane_id, pane);
 
         let tab = Tab {
@@ -225,6 +236,54 @@ impl TabManager {
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
         info!(tab_idx = idx, pane_id, host = %host, "SSH tab created");
+        idx
+    }
+
+    /// Create a new tab running `docker exec -it` inside the given container.
+    /// Returns the tab index. The pane's tab title is derived from
+    /// `container_label` (typically the container's display name).
+    pub fn new_docker_exec_tab(
+        &mut self,
+        viewport: Rect,
+        cell_w: f32,
+        cell_h: f32,
+        backend: Arc<dyn DockerBackend>,
+        container_id: String,
+        container_label: String,
+        shell: String,
+        rt: &Runtime,
+        waker: Waker,
+    ) -> usize {
+        let pane_id = self.alloc_pane_id();
+        let label_for_title = container_label.clone();
+        let pane = Pane::new_docker_exec(
+            pane_id,
+            viewport,
+            cell_w,
+            cell_h,
+            backend,
+            container_id.clone(),
+            container_label,
+            shell,
+            rt,
+            waker,
+        );
+        self.panes.insert(pane_id, pane);
+
+        let tab = Tab {
+            title: format!("🐳 {}", label_for_title),
+            layout: LayoutNode::Leaf(pane_id),
+            focused_pane: pane_id,
+        };
+        self.tabs.push(tab);
+        let idx = self.tabs.len() - 1;
+        self.active_tab = idx;
+        info!(
+            tab_idx = idx,
+            pane_id,
+            container = %container_id,
+            "docker exec tab created"
+        );
         idx
     }
 
@@ -272,6 +331,7 @@ impl TabManager {
         cell_h: f32,
         shell: Option<&str>,
         rt: &Runtime,
+        waker: Waker,
     ) -> anyhow::Result<()> {
         let tab = &self.tabs[self.active_tab];
         let focused = tab.focused_pane;
@@ -300,13 +360,13 @@ impl TabManager {
 
         if let Some(profile) = ssh_profile {
             // SSH pane → open a new SSH connection to the same host
-            let pane = Pane::new_ssh(new_id, half_rect, cell_w, cell_h, profile, rt);
+            let pane = Pane::new_ssh(new_id, half_rect, cell_w, cell_h, profile, rt, waker);
             self.panes.insert(new_id, pane);
             info!(focused, new_id, ?direction, "SSH pane split");
         } else {
             // Local pane → spawn the same shell
             let effective_shell = local_shell.as_deref().or(shell);
-            let pane = Pane::new(new_id, half_rect, cell_w, cell_h, effective_shell)?;
+            let pane = Pane::new(new_id, half_rect, cell_w, cell_h, effective_shell, waker)?;
             self.panes.insert(new_id, pane);
             info!(focused, new_id, ?direction, "local pane split");
         }
@@ -380,7 +440,13 @@ impl TabManager {
 
     /// Compute viewports for the active tab given the available rect.
     /// Updates pane viewports and resizes grids/PTYs as needed.
-    pub fn layout_active_tab(&mut self, available: Rect, cell_w: f32, cell_h: f32, gutter_cols: usize) {
+    pub fn layout_active_tab(
+        &mut self,
+        available: Rect,
+        cell_w: f32,
+        cell_h: f32,
+        gutter_cols: usize,
+    ) {
         if let Some(tab) = self.tabs.get(self.active_tab) {
             let mut viewports = Vec::new();
             tab.layout.compute_viewports(available, &mut viewports);

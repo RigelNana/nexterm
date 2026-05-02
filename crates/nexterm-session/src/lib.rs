@@ -2,8 +2,8 @@
 //!
 //! Session manager: tree-structured groups of SSH profiles, backed by SQLite.
 
-pub mod store;
 pub mod group;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
